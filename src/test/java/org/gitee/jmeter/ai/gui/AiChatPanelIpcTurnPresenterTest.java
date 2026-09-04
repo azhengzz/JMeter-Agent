@@ -150,6 +150,42 @@ class AiChatPanelIpcTurnPresenterTest {
     }
 
     @Test
+    void thinkingProgressSplitsThinkTagFromReplyBodyStyling() throws Exception {
+        // THINKING 进度载荷携带 <think>…</think> 包裹的思考 + 标签外正文（结构化
+        // reasoning_content 的展示形态，ProgressCallbackHookAdapter:43）：思考段保持
+        // 灰斜体并以 <think> 标签字面包裹，标签外的正文按回复正文样式渲染（非斜体、
+        // 主题色）。注：getText() 的 HTML 序列化不回写 color/font-style（loading 指示
+        // 同款丢样式）且会转义标签文本，样式断言走文档元素属性、标签断言走文档纯文本。
+        JTextPane chatArea = field(panel, "chatArea");
+        TurnHandle turn = new TurnHandle(sessionKey, TurnOrigin.IPC_CLI, "[from cli] hello", false);
+        panel.onTurnEvent(TurnEvent.started(turn));
+        awaitEdtDrained();
+
+        panel.onTurnEvent(TurnEvent.progress(turn,
+                ProgressUpdate.thinking("<think>REASON-TRACE</think>\nBODY-COMMENT")));
+        awaitUntil(() -> chatTextOnEdt(chatArea).contains("BODY-COMMENT"),
+                "thinking progress rendered");
+
+        String html = chatTextOnEdt(chatArea);
+        String diag = "reason=" + attrsToString(styleAttrsAt(chatArea, "REASON-TRACE"))
+                + " body=" + attrsToString(styleAttrsAt(chatArea, "BODY-COMMENT"));
+        assertTrue(html.contains("REASON-TRACE"), "思考段必须渲染 " + diag);
+        assertTrue(html.contains("BODY-COMMENT"), "标签外正文必须渲染 " + diag);
+        assertTrue(isItalicAt(chatArea, "REASON-TRACE"),
+                "think 内的思考段保持灰斜体样式 " + diag);
+        assertTrue("#787878".equalsIgnoreCase(cssColorAt(chatArea, "REASON-TRACE")),
+                "think 内的思考段保持思考灰（#787878）" + diag);
+        assertFalse(isItalicAt(chatArea, "BODY-COMMENT"),
+                "think 外的正文按正文样式渲染（非斜体），与思考可区分 " + diag);
+        // 思考段以 <think> 标签字面包裹展示（appendStyled 转义后作为文本渲染）
+        String docText = docTextOnEdt(chatArea);
+        assertTrue(docText.contains("<think>REASON-TRACE</think>"),
+                "思考段必须以 <think> 标签包裹展示 " + diag + " doc=" + docText);
+        assertFalse(docText.contains("<think>BODY-COMMENT"),
+                "正文段不得被 think 标签包裹 " + diag);
+    }
+
+    @Test
     void progressBeforeTurnStartIsDropped() throws Exception {
         // 未武装（回合 id 不在活回合集合）：早于 TURN_STARTED EDT 运行的投递丢弃
         TurnHandle turn = new TurnHandle(sessionKey, TurnOrigin.IPC_CLI, "[from cli] hello", false);
@@ -735,9 +771,9 @@ class AiChatPanelIpcTurnPresenterTest {
     /**
      * 对抗评审缺陷[2/10]（race lens）：终态先派发、注入槽后摘除的 [AgentLoop:509→534] 窗口。
      *
-     * 回合体在 try 尾（AgentLoop.java:509）emitTerminal 同步派发 TURN_COMPLETED，直到
-     * finally（:534）injectionManager.cleanup 才摘除路由槽（InjectionManager：槽 =
-     * injectionQueues.containsKey，hasActiveRun 的唯一事实来源）。面板 handleAgentResponse
+     * 回合体在 try 尾（AgentLoop.java:443）emitTerminal 同步派发 TURN_COMPLETED，直到
+     * finally（:470）activeTurnTokens.cleanup 才摘除路由槽（TurnRegistry：槽 = 条目
+     * 存在且未 closed，hasActiveRun 的事实来源）。面板 handleAgentResponse
      * （AiChatPanel.java:1098）以 hasActiveRun 判定是否复位按钮——EDT 若在窗口内出队
      * 处理该终态（生产触发：loop 线程被 turnTeardownLock 并发 offerInjection 短持、GC
      * 停顿或调度抢占停滞数毫秒），读到的是本回合自己尚未摘除的槽 → 误判「仍有回合
@@ -807,7 +843,7 @@ class AiChatPanelIpcTurnPresenterTest {
             // 终局断言都应绿，故此值不进断言防 false-red）
             final boolean slotStillRoutedInsideWindow = loop.hasActiveRun(sessionKey);
 
-            // ③ 放行 loop 线程：走完 finally（injectionManager.cleanup 摘槽；队列空 →
+            // ③ 放行 loop 线程：走完 finally（activeTurnTokens.cleanup 置 closed 摘槽；队列空 →
             // republishLeftovers 无孤儿）→ future 完成；再排空残余 EDT 事件（修复若走
             // 「收尾后补发复位事件」路线，其 EDT 落地由下方轮询窗口吸收）
             releaseLoop.countDown();
@@ -862,11 +898,11 @@ class AiChatPanelIpcTurnPresenterTest {
      * <ol>
      *   <li>占位回合（另一会话键的非命令消息）在 GatedCall 上挂起，钉死 runningLoop 的
      *       单线程 executor；/new 命令回合提交后停留在 [提交→pickup] 队列——
-     *       activeTurnHandles.put（AgentLoop.java:418）先于 execute 同步完成，
+     *       Turn 构造+注册（句柄随构造就位，AgentLoop.java:344-345）先于 execute 同步完成，
      *       activeTurn(sessionKey) 无需轮询即可查（窗口被阻塞任务无限期撑开）；</li>
      *   <li>领养是 invokeLater，断言前 invokeAndWait 排空 EDT（FIFO 保证领养先执行）；</li>
-     *   <li>终态负断言的锚：emitTerminal（AgentLoop.java:509）先于 future.complete
-     *       （:540）同步执行 → cmdFuture.get() 返回即证明 TURN_COMPLETED 已派发到
+     *   <li>终态负断言的锚：emitTerminal（AgentLoop.java:443）先于 future.complete
+     *       （:477）同步执行 → cmdFuture.get() 返回即证明 TURN_COMPLETED 已派发到
      *       面板的 onTurnEvent（invokeLater 已入队），再排空 EDT 后断言“未渲染”是确定的。</li>
      * </ol>
      */
@@ -1528,6 +1564,90 @@ class AiChatPanelIpcTurnPresenterTest {
     /** 排空 EDT：invokeAndWait 的任务入队并执行完毕后，之前入队的事件必然已执行。 */
     private static void awaitEdtDrained() throws Exception {
         SwingUtilities.invokeAndWait(() -> { });
+    }
+
+    /**
+     * needle 起点处的生效样式：自根沿祖先链合并到字符元素（HTML 内联样式落在块级
+     * 元素上，字符叶子自身可能不带）——视图解析样式的同一来源。EDT 上同步读取。
+     */
+    private static javax.swing.text.AttributeSet styleAttrsAt(JTextPane chatArea, String needle) {
+        try {
+            java.util.concurrent.atomic.AtomicReference<javax.swing.text.AttributeSet> ref =
+                    new java.util.concurrent.atomic.AtomicReference<>();
+            SwingUtilities.invokeAndWait(() -> {
+                try {
+                    javax.swing.text.StyledDocument doc = chatArea.getStyledDocument();
+                    int idx = doc.getText(0, doc.getLength()).indexOf(needle);
+                    if (idx < 0) {
+                        return;
+                    }
+                    java.util.ArrayList<javax.swing.text.Element> chain = new java.util.ArrayList<>();
+                    for (javax.swing.text.Element e = doc.getCharacterElement(idx);
+                            e != null; e = e.getParentElement()) {
+                        chain.add(e);
+                    }
+                    javax.swing.text.SimpleAttributeSet merged =
+                            new javax.swing.text.SimpleAttributeSet();
+                    for (int i = chain.size() - 1; i >= 0; i--) {
+                        merged.addAttributes(chain.get(i).getAttributes());
+                    }
+                    ref.set(merged);
+                } catch (javax.swing.text.BadLocationException ignored) {
+                    // needle 不在文档内：返回 null，由调用方断言失败
+                }
+            });
+            return ref.get();
+        } catch (Exception e) {
+            throw new IllegalStateException("cannot read style attributes on EDT", e);
+        }
+    }
+
+    /** styleAttrsAt 的斜体判定：HTML 文档把内联样式存为 CSS.Attribute 键（非 StyleConstants.Italic）。 */
+    private static boolean isItalicAt(JTextPane chatArea, String needle) {
+        javax.swing.text.AttributeSet attrs = styleAttrsAt(chatArea, needle);
+        Object fontStyle = attrs == null ? null
+                : attrs.getAttribute(javax.swing.text.html.CSS.Attribute.FONT_STYLE);
+        return "italic".equalsIgnoreCase(String.valueOf(fontStyle));
+    }
+
+    /** styleAttrsAt 的取色（CSS.Attribute.COLOR 的字符串值；无内联色返回 null）。 */
+    private static String cssColorAt(JTextPane chatArea, String needle) {
+        javax.swing.text.AttributeSet attrs = styleAttrsAt(chatArea, needle);
+        Object color = attrs == null ? null
+                : attrs.getAttribute(javax.swing.text.html.CSS.Attribute.COLOR);
+        return color == null ? null : String.valueOf(color);
+    }
+
+    /** AttributeSet 的诊断展开（失败消息用）。 */
+    private static String attrsToString(javax.swing.text.AttributeSet attrs) {
+        if (attrs == null) {
+            return "null";
+        }
+        StringBuilder sb = new StringBuilder("[");
+        for (java.util.Enumeration<?> e = attrs.getAttributeNames(); e.hasMoreElements(); ) {
+            Object k = e.nextElement();
+            sb.append(k).append('=').append(attrs.getAttribute(k)).append(' ');
+        }
+        return sb.append(']').toString();
+    }
+
+    /** 在 EDT 上读文档纯文本（非 HTML 源码）：字面标签断言用（getText 会转义且丢样式）。 */
+    private static String docTextOnEdt(JTextPane chatArea) {
+        try {
+            java.util.concurrent.atomic.AtomicReference<String> ref =
+                    new java.util.concurrent.atomic.AtomicReference<>();
+            SwingUtilities.invokeAndWait(() -> {
+                try {
+                    javax.swing.text.StyledDocument doc = chatArea.getStyledDocument();
+                    ref.set(doc.getText(0, doc.getLength()));
+                } catch (javax.swing.text.BadLocationException ignored) {
+                    ref.set("");
+                }
+            });
+            return ref.get();
+        } catch (Exception e) {
+            throw new IllegalStateException("cannot read document text on EDT", e);
+        }
     }
 
     /** 在 EDT 上读聊天区全文（HTML 源码）：Swing 组件读取须在 EDT，且轮询需同步取值。 */

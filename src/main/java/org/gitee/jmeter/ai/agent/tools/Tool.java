@@ -84,8 +84,8 @@ public interface Tool {
      * in parallel with other concurrency-safe tools in the same batch (Nanobot's
      * {@code concurrency_safe}; default-off whitelist admission).
      *
-     * <p>Tools returning false always execute alone, inline on the run carrier
-     * thread — never dispatched concurrently with other tools. Overriding to
+     * <p>Tools returning false always execute alone, inline on the run thread
+     * — never dispatched concurrently with other tools. Overriding to
      * true is a declaration that the tool only reads shared state and is safe
      * to overlap with other such readers.
      *

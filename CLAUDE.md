@@ -106,7 +106,7 @@ mvn clean package -DskipTests
 ### AI Agent 框架 (`org.gitee.jmeter.ai.agent`)
 核心 Agent 执行引擎，实现工具调用的闭环：
 
-- **AgentLoop** / **AgentLoopFactory** - Agent 主循环，驱动 LLM 调用 → 工具执行 → 结果反馈的迭代
+- **AgentLoop** / **AgentLoopFactory** - Agent 主循环，驱动 LLM 调用 → 工具执行 → 结果反馈的迭代（回合生命周期状态收敛于 `agent.turn` 单表，见「回合对象」）
 - **AgentConfig** - Agent 配置管理（模型、温度、最大轮次等）
 - **GenerationSettings** - AI 生成参数的唯一来源
 
@@ -135,10 +135,14 @@ mvn clean package -DskipTests
 - **SessionManager** - 管理多个会话的生命周期（每实例会话模式只加载当前 instanceId 的 jsonl，不解析历史遗留/其他实例文件）
 
 #### Agent 运行 (`agent/run`)
-- **AgentRunner** - 执行 Agent 运行
+- **AgentRunner** - 执行 Agent 运行（同步方法，跑在调用方线程：主链路 = agent-loop 专用执行器线程，子代理 = subagent 池线程；`runAgentLoop` 经 `LoopState` + 分支函数分解）
 - **AgentRunSpec** - 运行规格定义
 - **AgentRunResult** - 运行结果
-- **InjectionManager** - 管理注入点和依赖注入
+
+#### 回合对象 (`agent.turn`)
+- **Turn** - 单回合全部生命周期状态的聚合（原散落 AgentLoop 6 张 per-turn map + 3 ThreadLocal + InjectionManager 路由槽的状态收敛为一对象；sessionKey/handle/callback/delegated/abortFlag/completionLatch 构造时定，queue/future/epoch/ownResetEpoch/runnerThread/closed 为保序武装的 volatile 后写字段；含 drain/drainBlocking 注入队列消费）
+- **TurnRegistry** - 会话 → 在跑回合注册表（extends ConcurrentHashMap）；路由槽 = 条目 + `closed` 标志双生命周期：offer/closeRouting/cleanup/hasActiveRun 在 CHM bin 锁下原子，条目真正 remove 只在两处且均按值条件（`removeIfCurrent`，防误摘同 key 后继）：latch 释放点与 signalCancel 自我豁免步
+- **InjectionItem** - 注入队列条目（text + announcement 标记）
 
 #### Agent 模型 (`agent/model`)
 - **Message** / **ToolCall** / **ToolResult** - LLM 交互消息模型

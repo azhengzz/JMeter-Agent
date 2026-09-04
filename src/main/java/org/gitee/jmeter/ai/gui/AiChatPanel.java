@@ -41,6 +41,7 @@ import org.gitee.jmeter.ai.service.ClaudeService;
 import org.apache.jorphan.gui.JMeterUIDefaults;
 
 import org.gitee.jmeter.ai.utils.AiConfig;
+import org.gitee.jmeter.ai.utils.TextUtils;
 import org.gitee.jmeter.ai.utils.VersionUtils;
 import org.gitee.jmeter.ai.service.OpenAiService;
 import org.gitee.jmeter.ai.service.provider.ProviderRegistry;
@@ -633,7 +634,7 @@ public class AiChatPanel extends JPanel
     // 后仍存活。会话键过滤（非当前实例会话不派发）已由 AgentLoop.dispatchTurnEvent 完成。
 
     /**
-     * 事件入口：通知线程不保证（ipc-worker / commonPool / EDT / 本地提交线程）。
+     * 事件入口：通知线程不保证（ipc-worker / loop 线程 / EDT / 本地提交线程）。
      * 通知时快照会话代数（/new 翻转后到达的旧会话事件整段丢弃）；EDT 上零跳直派
      * （G1），否则 invokeLater。
      */
@@ -1195,12 +1196,25 @@ public class AiChatPanel extends JPanel
         }
     }
 
+    /**
+     * 渲染 THINKING 进度：载荷可能是纯思考，也可能携带 {@code <think>…</think>} 包裹的
+     * 思考 + 标签外的正文（结构化 reasoning_content 的展示形态，或模型内嵌标签）。
+     * 按段拆分渲染——思考段维持灰斜体并以 {@code <think>} 标签包裹展示（标签字面
+     * 可见），标签外的正文按回复正文样式（主题色 markdown）渲染，与思考内容区分。
+     */
     private void renderThinking(String text) throws BadLocationException {
         if (text == null || text.isEmpty()) {
             return;
         }
-        messageProcessor.appendStyled(chatArea.getStyledDocument(), text.stripTrailing(),
-                new Color(0x78, 0x78, 0x78), Font.ITALIC);
+        for (TextUtils.ThinkSegment segment : TextUtils.splitThink(text)) {
+            if (segment.thinking()) {
+                messageProcessor.appendStyled(chatArea.getStyledDocument(),
+                        "<think>" + segment.text() + "</think>",
+                        new Color(0x78, 0x78, 0x78), Font.ITALIC);
+            } else {
+                messageProcessor.appendMarkdown(chatArea.getStyledDocument(), segment.text(), null);
+            }
+        }
     }
 
     private void renderToolHint(String hint) throws BadLocationException {

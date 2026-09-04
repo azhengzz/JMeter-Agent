@@ -133,7 +133,7 @@ public class MemoryStore {
      * 超时置位后立即放弃(返回 {@code null},调用方按"未执行"处理),不占住载体线程、不
      * 泄漏;线程中断同样立即放弃。轮询的必要性:(a) {@code distillSync} 深度提炼跑在
      * commonPool 载体线程上,interrupt / {@code CF.cancel(true)} 都够不到;(b) 整合虽已
-     * 内联到可被 interrupt 命中的 run 任务线程,但阻塞式 {@code channel.lock()} 被
+     * 内联到可被 interrupt 命中的 run 执行线程,但阻塞式 {@code channel.lock()} 被
      * interrupt 会抛 {@code ClosedByInterruptException} 并关闭通道(破坏性)。abort flag
      * 是两条路径统一的取消事实来源,轮询让语义一致。
      *

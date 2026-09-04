@@ -9,7 +9,8 @@ package org.gitee.jmeter.ai.agent.run;
  * {@code ToolRegistry} replays it onto the tool-executor threads used for
  * concurrent tool execution, so it is visible wherever a tool runs.
  *
- * <p>Always clear in a finally block: both carriers are pooled threads, and a
+ * <p>Always clear in a finally block: the run threads are reused (the dedicated
+ * agent-loop thread across turns, pooled subagent threads across runs), and a
  * stale session key would route a subagent result into the wrong session.
  */
 public final class AgentRunContext {
@@ -38,7 +39,7 @@ public final class AgentRunContext {
         return CURRENT.get();
     }
 
-    /** Remove the binding. Must be called in a finally block on pooled threads. */
+    /** Remove the binding. Must be called in a finally block on reused threads. */
     public static void clear() {
         CURRENT.remove();
     }

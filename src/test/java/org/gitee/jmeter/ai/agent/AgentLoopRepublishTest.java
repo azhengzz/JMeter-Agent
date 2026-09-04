@@ -42,12 +42,14 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -624,6 +626,99 @@ class AgentLoopRepublishTest {
                 "REE 路径应发射孤儿错误终态事件而非静默丢弃");
         assertFalse(orphans.completedResponses().get(0).isSuccess(),
                 "REE 路径的孤儿终态应为错误回执");
+    }
+
+    // ------------------------------------------------------------------
+    // 重置栅栏（resetFenceLock）：「取消+代数翻转」与「代数检查+重发布」互斥
+    // ------------------------------------------------------------------
+
+    /**
+     * 栅栏互斥的确定性钉法：孤儿回合的 TURN_STARTED 派发发生在 republishLeftovers
+     * 持有 resetFenceLock 期间（startTurn 在锁内被调）——用在该事件上 park 的订阅者
+     * 把 loop 线程钉死在栅栏临界区内，此时另一线程的 resetConversation 必须阻塞在
+     * 锁外，不得穿插进「检查代数 → 重发布」之间（TOCTOU 缝隙会让旧代数孤儿漏网）。
+     * 放行后 reset 才入栅栏执行，代数翻转必须真实发生（非 loop 线程路径）。
+     */
+    @Test
+    void resetFence_mutuallyExcludesRepublish_andFlipsEpochOffLoopThread() throws Exception {
+        CountDownLatch republishStarted = new CountDownLatch(1);
+        CountDownLatch releaseRepublish = new CountDownLatch(1);
+        loop.addTurnSubscriber(new TurnSubscriber() {
+            @Override public void onTurnEvent(TurnEvent event) {
+                if (event.turn() != null && event.turn().origin() == TurnOrigin.REPUBLISH
+                        && event.kind() == TurnEvent.Kind.TURN_STARTED) {
+                    republishStarted.countDown();
+                    boolean released = false;
+                    while (!released) {
+                        try {
+                            released = releaseRepublish.await(5, TimeUnit.SECONDS);
+                        } catch (InterruptedException e) {
+                            // 取消中断不得提前解锁 park：栅栏持有方必须确定性收尾
+                        }
+                    }
+                    // 清掉取消路径可能落下的中断位，不带回 loop 线程后续流程
+                    Thread.interrupted();
+                }
+            }
+        });
+
+        // 构造必然走 re-publish 的自然完成残留（周期 5/5 封顶后的 LEFT）
+        OverflowTurn t = scriptOverflowingTurn();
+        aiService.scriptImmediate(LLMResponse.text("ORPHAN-FINAL"));
+
+        CompletableFuture<AgentResponse> f1 = loop.processMessage("M1", sessionKey);
+        for (int i = 0; i < 5; i++) {
+            await(t.calls().get(i).entered, "LLM call " + (i + 1));
+            assertTrue(loop.processMessage("FOLLOWUP-" + (i + 1), sessionKey)
+                    .get(TIMEOUT_SECONDS, TimeUnit.SECONDS).getContent().startsWith("Message injected"));
+            complete(t.calls().get(i));
+        }
+        await(t.calls().get(5).entered, "LLM call 6（周期已封顶）");
+        assertTrue(loop.processMessage("LEFT", sessionKey).get(TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                .getContent().startsWith("Message injected"));
+        complete(t.calls().get(5));
+        await(t.finalCall().entered, "final LLM call");
+        complete(t.finalCall());
+
+        // loop 线程进入内层 finally → 栅栏 → re-publish → 孤儿 STARTED 派发 → park：
+        // 此刻 loop 线程被钉在 resetFenceLock 临界区内
+        assertTrue(republishStarted.await(TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                "loop thread should reach the orphan STARTED dispatch inside the fence");
+        assertFalse(f1.isDone(), "park 期间原回合 future 不得落定（complete 在内层 finally 之后）");
+
+        // 非_loop 线程的重置必须阻塞在栅栏外
+        AtomicBoolean resetDone = new AtomicBoolean(false);
+        AtomicReference<Throwable> resetFailure = new AtomicReference<>();
+        Thread resetter = new Thread(() -> {
+            try {
+                loop.resetConversation(sessionKey);
+                resetDone.set(true);
+            } catch (Throwable e) {
+                resetFailure.set(e);
+            }
+        }, "fence-resetter");
+        resetter.start();
+        Thread.sleep(400);
+        assertFalse(resetDone.get(), "resetConversation 必须阻塞在 resetFenceLock 外，不得穿插进重发布临界区");
+
+        // 放行：重发布收尾，reset 才入栅栏执行「取消 + 代数翻转」
+        releaseRepublish.countDown();
+        resetter.join(5000);
+        assertNull(resetFailure.get(), "resetter 不应抛异常");
+        assertTrue(resetDone.get(), "放行后 reset 应完成");
+
+        // 原回合 future：正常完成；或被放行后抢得栅栏的 reset 以 RESET 取消（终态事件
+        // 与 re-publish 均已完成，两种交错都是合法产物，此处不约束）
+        try {
+            assertEquals("T1-FINAL", f1.get(TIMEOUT_SECONDS, TimeUnit.SECONDS).getContent());
+        } catch (CancellationException postFenceRace) {
+            // reset 恰在 future.complete 前入栅栏：合法竞态，终态事件此前已发
+        }
+
+        // 代数翻转真实发生（非 loop 线程路径；若翻转被 self 守卫吞掉此处回到 1）
+        assertEquals(2L, loop.markConversationReset(sessionKey),
+                "resetter 的 resetConversation 必须把代数从 0 翻到 1（本调用翻到 2）");
+        awaitUntil(() -> !loop.hasActiveRun(sessionKey), "all turns settle");
     }
 
     // ------------------------------------------------------------------

@@ -13,14 +13,17 @@ import org.gitee.jmeter.ai.agent.model.ToolResult;
 import org.gitee.jmeter.ai.agent.model.GenerationSettings;
 import org.gitee.jmeter.ai.agent.presenter.CancelCause;
 import org.gitee.jmeter.ai.agent.presenter.TurnEvent;
+import org.gitee.jmeter.ai.agent.presenter.TurnHandle;
 import org.gitee.jmeter.ai.agent.presenter.TurnOrigin;
 import org.gitee.jmeter.ai.agent.presenter.TurnSubscriber;
-import org.gitee.jmeter.ai.agent.run.InjectionManager;
 import org.gitee.jmeter.ai.agent.session.Session;
 import org.gitee.jmeter.ai.agent.session.SessionManager;
 import org.gitee.jmeter.ai.instance.InstanceContext;
 import org.gitee.jmeter.ai.agent.tools.Tool;
 import org.gitee.jmeter.ai.agent.tools.ToolRegistry;
+import org.gitee.jmeter.ai.agent.turn.InjectionItem;
+import org.gitee.jmeter.ai.agent.turn.Turn;
+import org.gitee.jmeter.ai.agent.turn.TurnRegistry;
 import org.gitee.jmeter.ai.service.AiService;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -41,11 +44,15 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -59,8 +66,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *   <li>委派消息：健康回合 busy 拒绝 vs 垂死窗口放行成独立委派回合；</li>
  *   <li>re-publish 级联（孤儿回合自身被注入再被 Stop，二级孤儿）；</li>
  *   <li>/new 命令落在垂死窗口；无订阅者时的 re-publish；双会话交错；</li>
- *   <li>offer 与 cancelRouting 的原子性压力（竞态的穷举攻击：每一条返回 true 的
+ *   <li>offer 与 closeRouting/cleanup 的原子性压力（竞态的穷举攻击：每一条返回 true 的
  *       offer 必须能在队列里找到，无一丢失、无一幻影）；</li>
+ *   <li>signalCancel 与回合收尾（clearRunnerThread 置 null）的全生命周期锤击
+ *       （判空/解引用分读 volatile 的 NPE 窗口）；取消排队中的外会话回合不连坐在跑
+ *       回合的线程与路由槽；</li>
  *   <li>三会话混合操作 soak（无 ExecutionException、全部收敛）。</li>
  * </ul>
  */
@@ -162,6 +172,73 @@ class AgentLoopAdversarialTest {
         assertEquals("R3-CLEAN", f3.get(TIMEOUT_SECONDS, TimeUnit.SECONDS).getContent(),
                 "两轮取消后的第三轮必须完好");
         awaitUntil(() -> !loop.hasActiveRun(sessionKey), "settles");
+    }
+
+    /**
+     * signalCancel 与回合收尾（clearRunnerThread 置 null）的全生命周期交错压测：
+     * 取消方线程全程锤 signalCancel，回合起→跑→收尾落地。任何一次 signalCancel 抛
+     * Throwable 都算失败——尤其「判空与解引用分读 volatile」的 NPE 窗口：收尾置 null
+     * 恰落两读之间会 NPE 并吞掉第 3-5 步（对抗审查 2026-09-02 确认的回归窗口；
+     * 现实现为单次读入局部再判空解引用）。
+     */
+    @Test
+    void signalCancelDuringTeardown_hammeringNeverThrows() throws Exception {
+        for (int iter = 0; iter < 150; iter++) {
+            ScriptedCall call = aiService.scriptGated(LLMResponse.text("R-" + iter));
+            CompletableFuture<AgentResponse> f = loop.processMessage("M-" + iter, sessionKey);
+            await(call.entered, "iter " + iter + " LLM call started");
+
+            AtomicBoolean stop = new AtomicBoolean(false);
+            AtomicReference<Throwable> thrown = new AtomicReference<>();
+            Thread canceller = new Thread(() -> {
+                while (!stop.get()) {
+                    try {
+                        loop.signalCancel(sessionKey);
+                    } catch (Throwable t) {
+                        thrown.compareAndSet(null, t);
+                        return;
+                    }
+                }
+            }, "cancel-hammer-" + iter);
+            canceller.start();
+
+            complete(call);   // 回合收尾（clearRunnerThread 置 null）与锤击全程交错
+            try {
+                f.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            } catch (CancellationException cancelRace) {
+                // 锤击取消竞态下的预期落定方式之一
+            }
+            awaitUntil(() -> !loop.hasActiveRun(sessionKey), "iter " + iter + " settles");
+            stop.set(true);
+            canceller.join(5000);
+            assertNull(thrown.get(), "signalCancel 不得在收尾交错中抛出（iter " + iter + "）");
+        }
+    }
+
+    /**
+     * 取消排队中的外会话回合不得连坐在跑回合：interrupt 直达目标回合的 runnerThread
+     * （pickup 写入）——排队回合 runnerThread 为 null，取消只走 abortFlag +
+     * future.cancel + 死任务 guard；A 会话在跑回合的执行线程、abortFlag 与路由槽
+     * 均不受 B 的取消影响。
+     */
+    @Test
+    void cancelQueuedForeignSession_runningTurnNotInterrupted() throws Exception {
+        ScriptedCall blocker = aiService.scriptGated(LLMResponse.text("A-DONE"));
+        CompletableFuture<AgentResponse> fA = loop.processMessage("a-msg", "sess-A");
+        await(blocker.entered, "session A runner parked in LLM call");
+
+        CompletableFuture<AgentResponse> fB = loop.processMessage("b-msg", "sess-B");   // 排队（未 pickup）
+        assertTrue(loop.signalCancel("sess-B"), "排队中的 B 回合可取消（abort+future.cancel）");
+        assertThrows(CancellationException.class, () -> fB.get(1, TimeUnit.SECONDS));
+        assertTrue(loop.hasActiveRun("sess-A"), "取消 B 不得摘 A 的路由槽");
+
+        Thread aRunner = ((Turn) loop.currentTurnToken("sess-A").identity()).runnerThread();
+        assertNotNull(aRunner, "A 回合在跑，runnerThread 已写");
+        assertFalse(aRunner.isInterrupted(), "取消排队中的 B 不得把中断打上 A 的执行线程");
+
+        complete(blocker);
+        assertEquals("A-DONE", fA.get(TIMEOUT_SECONDS, TimeUnit.SECONDS).getContent(),
+                "A 回合必须照常完成（abortFlag/线程均未被 B 的取消连坐）");
     }
 
     // ------------------------------------------------------------------
@@ -380,28 +457,30 @@ class AgentLoopAdversarialTest {
     }
 
     // ------------------------------------------------------------------
-    // offer 与 cancelRouting 的原子性压力（竞态穷举攻击）
+    // offer 与 closeRouting 的原子性压力（竞态穷举攻击）
     // ------------------------------------------------------------------
 
     /**
      * 每一条 offer 返回 true 的消息，最终必须恰好出现在该队列里（drain 可见）——
      * 不丢失（写入悬挂队列却回 true）、不幻影（返回 true 但队列里没有）。
-     * 多轮 register→并发 offer→cancelRouting 交错，穷举攻击 computeIfPresent 与
-     * remove 的 bin 锁互斥。
+     * 多轮 register→并发 offer→closeRouting 交错，穷举攻击 computeIfPresent 与
+     * 置 closed 的 bin 锁互斥。
      */
     @Test
-    void offerVsCancelRouting_atomicityStress() throws Exception {
-        InjectionManager manager = new InjectionManager();
+    void offerVsCloseRouting_atomicityStress() throws Exception {
+        TurnRegistry registry = new TurnRegistry();
         for (int iter = 0; iter < 300; iter++) {
             final String key = "s-" + iter;
-            final LinkedBlockingQueueHolder holder = new LinkedBlockingQueueHolder(manager.register(key));
+            final Turn turn = newTurn(key);
+            registry.register(key, turn);
+            turn.armQueue();
             final List<String> acked = new CopyOnWriteArrayList<>();
             final AtomicInteger offeredCount = new AtomicInteger();
             final CountDownLatch offersDone = new CountDownLatch(1);
 
             Thread offerer = new Thread(() -> {
                 for (int i = 0; i < 60; i++) {
-                    if (manager.offer(key, "m-" + i)) {
+                    if (registry.offer(key, "m-" + i, false)) {
                         acked.add("m-" + i);
                     }
                     offeredCount.incrementAndGet();
@@ -410,17 +489,18 @@ class AgentLoopAdversarialTest {
             });
             offerer.start();
 
-            // 在 offer 进行到一半时摘槽（与生产 signalCancel 的时序交错对齐）
+            // 在 offer 进行到一半时摘槽（与生产 signalCancel 的时序交错对齐；本回合即
+            // 当前条目，身份守卫放行置 closed）
             while (offeredCount.get() < 25) {
                 Thread.onSpinWait();
             }
-            manager.cancelRouting(key);
+            registry.closeRouting(key, turn);
 
             assertTrue(offersDone.await(5, TimeUnit.SECONDS), "offerer must finish");
             offerer.join();
 
             List<String> drained = new ArrayList<>();
-            for (InjectionManager.InjectionItem item : manager.cleanup(key, holder.queue)) {
+            for (InjectionItem item : registry.cleanup(key, turn)) {
                 drained.add(item.getText());
             }
             Collections.sort(drained);
@@ -428,15 +508,65 @@ class AgentLoopAdversarialTest {
             Collections.sort(sortedAcked);
             assertEquals(sortedAcked, drained,
                     "iter " + iter + ": acked 与队列内容必须一一对应（不丢失、不幻影）");
-            assertFalse(manager.hasActiveRun(key));
+            assertFalse(registry.hasActiveRun(key));
         }
     }
 
-    /** holder 只为在 lambda 里 effectively-final 持有队列引用。 */
-    private static final class LinkedBlockingQueueHolder {
-        final java.util.concurrent.LinkedBlockingQueue<InjectionManager.InjectionItem> queue;
-        LinkedBlockingQueueHolder(java.util.concurrent.LinkedBlockingQueue<InjectionManager.InjectionItem> queue) {
-            this.queue = queue;
+    /** 构造最小回合（句柄即可用：无 loop 依赖，供路由槽原子性测试直用 TurnRegistry）。 */
+    private static Turn newTurn(String sessionKey) {
+        return new Turn(sessionKey,
+                new TurnHandle(sessionKey, TurnOrigin.LOCAL_PANEL, "echo", false),
+                null, false);
+    }
+
+    /**
+     * offer 与 cleanup（收尾善后：身份条件置 closed + 抽干）的原子性镜像压测：
+     * cleanup 的置 closed 与 offer 同一 CHM bin 锁——offer 要么赶在置位前入队（必被
+     * cleanup 的 drainAll 抽到）、要么事后见 closed 被拒（不 ack）。每一条 ack 的消息
+     * 必须恰好出现在 cleanup 的返回里，不丢失、不幻影。
+     */
+    @Test
+    void offerVsCleanup_atomicityStress() throws Exception {
+        TurnRegistry registry = new TurnRegistry();
+        for (int iter = 0; iter < 300; iter++) {
+            final String key = "c-" + iter;
+            final Turn turn = newTurn(key);
+            registry.register(key, turn);
+            turn.armQueue();
+            final List<String> acked = new CopyOnWriteArrayList<>();
+            final AtomicInteger offeredCount = new AtomicInteger();
+            final CountDownLatch offersDone = new CountDownLatch(1);
+
+            Thread offerer = new Thread(() -> {
+                for (int i = 0; i < 60; i++) {
+                    if (registry.offer(key, "m-" + i, false)) {
+                        acked.add("m-" + i);
+                    }
+                    offeredCount.incrementAndGet();
+                }
+                offersDone.countDown();
+            });
+            offerer.start();
+
+            // 在 offer 进行到一半时收尾善后（与生产内层 finally 的时序交错对齐）
+            while (offeredCount.get() < 25) {
+                Thread.onSpinWait();
+            }
+            List<InjectionItem> remaining = registry.cleanup(key, turn);
+
+            assertTrue(offersDone.await(5, TimeUnit.SECONDS), "offerer must finish");
+            offerer.join();
+
+            List<String> drained = new ArrayList<>();
+            for (InjectionItem item : remaining) {
+                drained.add(item.getText());
+            }
+            Collections.sort(drained);
+            List<String> sortedAcked = new ArrayList<>(acked);
+            Collections.sort(sortedAcked);
+            assertEquals(sortedAcked, drained,
+                    "iter " + iter + ": acked 与 cleanup 抽干内容必须一一对应（不丢失、不幻影）");
+            assertFalse(registry.hasActiveRun(key));
         }
     }
 
@@ -478,6 +608,117 @@ class AgentLoopAdversarialTest {
             String key = s;
             awaitUntil(() -> !loop.hasActiveRun(key), "session " + s + " settles");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 修复钉定（对抗审查 2026-09-03 追加验证的确定性复现）
+    // ------------------------------------------------------------------
+
+    /**
+     * FIX-2 钉定：signalCancel 第 2 步 runnerThread 单次读入局部——判空与 interrupt
+     * 各读一次 volatile 的旧写法在收尾置 null 落于两读之间时 NPE 并吞掉第 3-5 步。
+     * 压测（150 迭代锤击）对该窗口检出率仅 ~1/5，此处在 mock Turn 上以连续桩
+     * {@code thenReturn(probe, null)} 确定性命中：首读见 probe、次读见 null，
+     * 双读写法必 NPE，单读写法中断真实送达 probe 线程且第 3-5 步照常走完。
+     */
+    @Test
+    void signalCancel_runnerThreadSingleRead_interruptLands_noNpe() throws Exception {
+        // 反射取 loop 私有注册表（同包 + classpath，模式沿 AiChatPanelNewConversationTest）
+        java.lang.reflect.Field field = AgentLoop.class.getDeclaredField("activeTurnTokens");
+        field.setAccessible(true);
+        TurnRegistry registry = (TurnRegistry) field.get(loop);
+
+        // 活着的探针线程：停等释放闩，被 interrupt 时记旗标（unstarted 线程收不到中断）
+        CountDownLatch probeParked = new CountDownLatch(1);
+        CountDownLatch releaseProbe = new CountDownLatch(1);
+        CountDownLatch probeDone = new CountDownLatch(1);
+        AtomicBoolean probeInterrupted = new AtomicBoolean(false);
+        Thread probe = new Thread(() -> {
+            probeParked.countDown();
+            try {
+                releaseProbe.await();
+            } catch (InterruptedException e) {
+                probeInterrupted.set(true);
+                Thread.currentThread().interrupt();
+            } finally {
+                probeDone.countDown();
+            }
+        }, "fix2-runner-probe");
+        probe.start();
+        assertTrue(probeParked.await(5, TimeUnit.SECONDS), "probe 须先停稳");
+
+        // mock Turn：future 未武装（排队窗口语义）、runnerThread 首读见 probe 次读见 null
+        Turn mockTurn = Mockito.mock(Turn.class);
+        Mockito.when(mockTurn.abortFlag()).thenReturn(new AtomicBoolean());
+        Mockito.when(mockTurn.future()).thenReturn(null);
+        Mockito.when(mockTurn.runnerThread()).thenReturn(probe, (Thread) null);
+        registry.register(sessionKey, mockTurn);
+
+        try {
+            assertTrue(loop.signalCancel(sessionKey), "abortFlag 置位路径应返回 true");
+            // interrupt() 只置位并异步唤起 park——旗标由 probe 的 catch 置上，
+            // 须等 probe 真正跑完 catch（probeDone）再读，否则与调度竞态
+            assertTrue(probeDone.await(5, TimeUnit.SECONDS), "probe 须观察到中断并收尾");
+            assertTrue(probeInterrupted.get(),
+                    "单次读取的中断必须真实送达 probe 线程（双读写法在此行前已 NPE）");
+        } finally {
+            releaseProbe.countDown();
+            probe.join(5000);
+            registry.removeIfCurrent(sessionKey, mockTurn);
+        }
+    }
+
+    /**
+     * 武装窗口取消（[register → armFuture]，finding #3）：TURN_STARTED 在提交线程上
+     * 同步派发、早于 future 创建——停车订阅者把提交线程钉死在该派发内，即得 future
+     * 未武装的注册回合。此刻 Stop 只能靠 abortFlag：任务照常被取出、首次迭代即中止，
+     * 终态为 TURN_COMPLETED（空内容），绝不 TURN_CANCELLED / CancellationException，
+     * LLM 一次也不被调（脚本耗尽的 DEFAULT-FINAL 不得出现在回执里）。
+     */
+    @Test
+    void cancelDuringArmingWindow_taskRunsAndAborts_completesWithoutCancelledTerminal() throws Exception {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch releaseTurnStarted = new CountDownLatch(1);
+        List<TurnEvent> events = new CopyOnWriteArrayList<>();
+        loop.addTurnSubscriber(new TurnSubscriber() {
+            @Override public void onTurnEvent(TurnEvent event) {
+                if (event.turn() == null || !sessionKey.equals(event.turn().sessionKey())) {
+                    return;
+                }
+                events.add(event);
+                if (event.kind() == TurnEvent.Kind.TURN_STARTED) {
+                    started.countDown();
+                    try {
+                        releaseTurnStarted.await();  // 钉死提交线程：TURN_STARTED 派发点停车
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            }
+        });
+
+        AtomicReference<CompletableFuture<AgentResponse>> futureRef = new AtomicReference<>();
+        Thread driver = new Thread(() ->
+                futureRef.set(loop.processMessage("arming-window-msg", sessionKey)));
+        driver.start();
+        assertTrue(started.await(5, TimeUnit.SECONDS), "提交线程须停在 TURN_STARTED 派发内");
+
+        // future 尚未武装：abortFlag 是唯一通道，signalCancel 仍须如实报告可见
+        assertTrue(loop.signalCancel(sessionKey));
+
+        releaseTurnStarted.countDown();
+        driver.join(5000);
+        CompletableFuture<AgentResponse> f = futureRef.get();
+        assertNotNull(f, "processMessage 必须返回 future");
+        AgentResponse resp = f.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);  // CancellationException 即失败
+        assertFalse(String.valueOf(resp.getContent()).contains("DEFAULT-FINAL"),
+                "LLM 不得被调用（脚本空 → DEFAULT-FINAL 是被调用的指纹）");
+
+        long cancelled = events.stream().filter(e -> e.kind() == TurnEvent.Kind.TURN_CANCELLED).count();
+        long completed = events.stream().filter(e -> e.kind() == TurnEvent.Kind.TURN_COMPLETED).count();
+        assertEquals(0L, cancelled, "武装窗口的取消不发 TURN_CANCELLED（future 未武装）");
+        assertEquals(1L, completed, "STARTED 已发的回合必须收到恰好一个终态：空内容 TURN_COMPLETED");
+        awaitUntil(() -> !loop.hasActiveRun(sessionKey), "回合收尾后注册表清空");
     }
 
     // ------------------------------------------------------------------

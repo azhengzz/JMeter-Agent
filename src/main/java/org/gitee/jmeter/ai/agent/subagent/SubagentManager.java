@@ -39,9 +39,11 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * <p>Two invariants matter:
  * <ul>
- *   <li>Every spawn builds its OWN {@link AgentRunner}. The runner tracks its
- *       running thread in a single field, so a shared instance would let
- *       concurrent runs clobber each other's Stop target.</li>
+ *   <li>Every spawn builds its OWN {@link AgentRunner} (cheap, keeps concurrent
+ *       runs isolated from any future per-run state). Cancel/shutdown
+ *       interrupts reach the task's pool thread directly through
+ *       {@code handle.runThread} — {@link AgentRunner} does not track its own
+ *       thread.</li>
  *   <li>Subagents run through {@code agentRunner.run(spec)} directly, never
  *       through {@code AgentLoop.processMessage}, whose session bookkeeping is
  *       not governed by {@code persistSession}.</li>
@@ -208,10 +210,16 @@ public class SubagentManager {
                              TurnToken turnToken, SubagentStatus status, AtomicBoolean abortFlag,
                              RunningSubagent handle) {
         handle.started = true;
+        // 池线程直达中断：cancelBySession/shutdown 经 handle.runThread.interrupt()
+        // 命中本任务——显式方案，不依赖下方 future.cancel(true) 的隐式中断副作用
+        // （防未来 cancel(true)→cancel(false) 静默丢子代理中断）。句目随 releaseSlot
+        // 从 running 表摘除后句柄不可达，引用无需显式清空。
+        handle.runThread = Thread.currentThread();
         log.info("Subagent [{}] starting task: {}", taskId, label);
         try {
-            // Own runner per spawn: AgentRunner tracks its running thread in one
-            // field, so sharing would break Stop targeting across concurrent runs.
+            // Own runner per spawn: keeps concurrent runs isolated from any
+            // future per-run state (interrupt targeting no longer reasons about
+            // the runner — it goes through handle.runThread above).
             // Null consolidator: subagents never consolidate memory (persistSession=false
             // gates both call sites); ContextWindowManager tolerates null.
             AgentRunner runner = new AgentRunner(
@@ -223,16 +231,15 @@ public class SubagentManager {
                 maxIterations,
                 toolResultMaxChars,
                 toolTimeoutMs);
-            handle.runner = runner;
 
             List<Message> initial = List.of(
                 Message.system(buildSubagentPrompt()),
                 Message.user(task));
 
-            // Deliberately NO runExecutor: this method already runs on the subagent
-            // pool, which is what keeps subagents off the main agent's thread. Asking
-            // AgentRunner to schedule onto that same bounded pool and then joining
-            // below would starve it — with the default pool size of 1, permanently.
+            // AgentRunner.run is synchronous and executes inline on this subagent
+            // pool thread — which is what keeps subagents off the main agent's
+            // thread (the old "NO runExecutor, must not join on our own bounded
+            // pool" starvation concern is gone with the async wrapper).
             AgentRunSpec spec = AgentRunSpec.builder()
                 .sessionKey(AgentRunSpec.SUBAGENT_SESSION_PREFIX + taskId)
                 .initialMessages(initial)
@@ -250,7 +257,7 @@ public class SubagentManager {
                 .abortFlag(abortFlag)
                 .build();
 
-            AgentRunResult result = runner.run(spec).join();
+            AgentRunResult result = runner.run(spec);
 
             if (abortFlag.get()) {
                 status.markError("Cancelled");
@@ -280,7 +287,10 @@ public class SubagentManager {
                 log.warn("Subagent [{}] failed: {}", taskId, error);
                 announceResult(taskId, label, task, error, mainSessionKey, turnToken, false);
             }
-        } catch (Exception e) {
+        } catch (Throwable e) {
+            // Throwable（含 Error）：run() 同步直调后异常不再经 .join() 包成
+            // CompletionException，Error 会裸穿——不在这里收口就静默死进无人
+            // get() 的 executor future，子代理状态永挂 running、结果无人公告。
             log.error("Subagent [" + taskId + "] failed", e);
             status.markError(String.valueOf(e.getMessage()));
             announceResult(taskId, label, task, "Error: " + e.getMessage(),
@@ -518,8 +528,8 @@ public class SubagentManager {
                 continue;
             }
             handle.abortFlag.set(true);
-            if (handle.runner != null) {
-                handle.runner.interrupt();
+            if (handle.runThread != null) {
+                handle.runThread.interrupt();
             }
             boolean neverStarted = handle.future != null
                 && handle.future.cancel(true)
@@ -545,8 +555,8 @@ public class SubagentManager {
     public void shutdown() {
         for (RunningSubagent handle : running.values()) {
             handle.abortFlag.set(true);
-            if (handle.runner != null) {
-                handle.runner.interrupt();
+            if (handle.runThread != null) {
+                handle.runThread.interrupt();
             }
         }
         executor.shutdownNow();
@@ -577,7 +587,8 @@ public class SubagentManager {
         final AtomicBoolean abortFlag;
         /** The turn that spawned this subagent; used to scope drain waits and delivery. */
         final TurnToken turnToken;
-        volatile AgentRunner runner;
+        /** 执行本任务的池线程（任务体开头赋值）：取消/shutdown 的 interrupt 直达目标（见 runSubagent 注释）。 */
+        volatile Thread runThread;
         volatile Future<?> future;
         /** Set when the task body begins; false means a cancel skipped it entirely. */
         volatile boolean started;

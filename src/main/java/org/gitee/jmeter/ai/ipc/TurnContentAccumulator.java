@@ -13,7 +13,7 @@ import org.gitee.jmeter.ai.agent.model.ProgressUpdate;
  * 不作为累积来源（design D5）；{@code onStream} 无调用方（无流式 API）。
  * 部分内容定位为「尽力而为」：无注入续跑的回合并无中间回复可累积，快照为空。
  *
- * <p>线程安全：回调从 agent-loop / commonPool 载体线程打点，取消/超时读取在
+ * <p>线程安全：回调从 agent-loop / 子代理池线程打点，取消/超时读取在
  * ipc-worker 线程——append 与 snapshot 并发，均加锁。
  */
 public final class TurnContentAccumulator implements AgentLoop.ProgressCallback {

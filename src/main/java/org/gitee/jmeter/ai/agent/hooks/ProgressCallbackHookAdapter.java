@@ -38,9 +38,12 @@ public class ProgressCallbackHookAdapter implements AgentHook {
 
             String display;
             if (reasoningContent != null && !reasoningContent.isEmpty()) {
-                // Structured reasoning_content is separated from content
+                // Structured reasoning_content is separated from content. content may be null
+                // (a thinking+tool_use iteration emits no text block) — concatenating it
+                // verbatim would paint a literal "null"; append only real content.
                 display = showThinking
-                        ? "<think>" + reasoningContent + "</think>" + "\n" + content
+                        ? "<think>" + reasoningContent + "</think>"
+                          + (content != null && !content.isEmpty() ? "\n" + content : "")
                         : TextUtils.stripThink(content);
             } else {
                 // No structured field — thinking may be embedded as <think/> tags in content

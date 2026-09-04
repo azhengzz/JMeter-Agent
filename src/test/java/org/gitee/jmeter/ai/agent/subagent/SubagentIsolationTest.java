@@ -2,12 +2,16 @@ package org.gitee.jmeter.ai.agent.subagent;
 
 import org.gitee.jmeter.ai.agent.model.Message;
 import org.gitee.jmeter.ai.agent.model.ToolResult;
+import org.gitee.jmeter.ai.agent.presenter.TurnHandle;
+import org.gitee.jmeter.ai.agent.presenter.TurnOrigin;
 import org.gitee.jmeter.ai.agent.run.AgentRunContext;
 import org.gitee.jmeter.ai.agent.run.AgentRunSpec;
-import org.gitee.jmeter.ai.agent.run.InjectionManager;
 import org.gitee.jmeter.ai.agent.tools.AbstractTool;
 import org.gitee.jmeter.ai.agent.tools.Tool;
 import org.gitee.jmeter.ai.agent.tools.ToolRegistry;
+import org.gitee.jmeter.ai.agent.turn.InjectionItem;
+import org.gitee.jmeter.ai.agent.turn.Turn;
+import org.gitee.jmeter.ai.agent.turn.TurnRegistry;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -167,12 +171,12 @@ class SubagentIsolationTest {
 
     @Test
     void drainBlockingReturnsReadyMessagesWithoutWaiting() {
-        InjectionManager manager = new InjectionManager();
-        var queue = manager.register("s1");
-        manager.offer("s1", "ready");
+        TurnRegistry registry = new TurnRegistry();
+        Turn turn = armedTurn(registry, "s1");
+        registry.offer("s1", "ready", false);
 
         long start = System.currentTimeMillis();
-        List<String> items = texts(manager.drainBlocking(queue, 3, 10_000));
+        List<String> items = texts(turn.drainBlocking(3, 10_000));
 
         assertEquals(List.of("ready"), items);
         assertTrue(System.currentTimeMillis() - start < 1_000, "must not block when a message is ready");
@@ -180,29 +184,28 @@ class SubagentIsolationTest {
 
     @Test
     void drainBlockingReturnsEmptyOnTimeout() {
-        InjectionManager manager = new InjectionManager();
-        var queue = manager.register("s1");
+        Turn turn = armedTurn(new TurnRegistry(), "s1");
 
-        List<String> items = texts(manager.drainBlocking(queue, 3, 150));
+        List<String> items = texts(turn.drainBlocking(3, 150));
 
         assertTrue(items.isEmpty());
     }
 
     @Test
     void drainBlockingWakesWhenResultArrives() throws Exception {
-        InjectionManager manager = new InjectionManager();
-        var queue = manager.register("s1");
+        TurnRegistry registry = new TurnRegistry();
+        Turn turn = armedTurn(registry, "s1");
 
         AtomicReference<List<String>> result = new AtomicReference<>();
         CountDownLatch done = new CountDownLatch(1);
         Thread waiter = new Thread(() -> {
-            result.set(texts(manager.drainBlocking(queue, 3, 10_000)));
+            result.set(texts(turn.drainBlocking(3, 10_000)));
             done.countDown();
         });
         waiter.start();
 
         Thread.sleep(100);
-        manager.offer("s1", "subagent result");
+        registry.offer("s1", "subagent result", false);
 
         assertTrue(done.await(5, TimeUnit.SECONDS), "waiter must wake when a result is offered");
         assertEquals(List.of("subagent result"), result.get());
@@ -210,15 +213,14 @@ class SubagentIsolationTest {
 
     @Test
     void drainBlockingRestoresInterruptFlagAndReturnsEmpty() throws Exception {
-        InjectionManager manager = new InjectionManager();
-        var queue = manager.register("s1");
+        Turn turn = armedTurn(new TurnRegistry(), "s1");
 
         AtomicReference<List<String>> result = new AtomicReference<>();
         AtomicBoolean interruptFlagSet = new AtomicBoolean();
         CountDownLatch done = new CountDownLatch(1);
 
         Thread waiter = new Thread(() -> {
-            result.set(texts(manager.drainBlocking(queue, 3, 30_000)));
+            result.set(texts(turn.drainBlocking(3, 30_000)));
             interruptFlagSet.set(Thread.currentThread().isInterrupted());
             done.countDown();
         });
@@ -232,9 +234,22 @@ class SubagentIsolationTest {
         assertTrue(interruptFlagSet.get(), "interrupt flag must be restored so the loop aborts");
     }
 
+    /**
+     * 构造已注册进 registry 并武装队列的回合（drain 语义测试用；offer 侧走同一
+     * 注册表路由，与生产 AgentLoop 同构）。
+     */
+    private static Turn armedTurn(TurnRegistry registry, String sessionKey) {
+        Turn turn = new Turn(sessionKey,
+                new TurnHandle(sessionKey, TurnOrigin.LOCAL_PANEL, "echo", false),
+                null, false);
+        registry.register(sessionKey, turn);
+        turn.armQueue();
+        return turn;
+    }
+
     /** 句柄 API 返回 InjectionItem；断言仍按纯文本比较。 */
-    private static List<String> texts(List<InjectionManager.InjectionItem> items) {
-        return items.stream().map(InjectionManager.InjectionItem::getText).toList();
+    private static List<String> texts(List<InjectionItem> items) {
+        return items.stream().map(InjectionItem::getText).toList();
     }
 
     // ---- run context ----

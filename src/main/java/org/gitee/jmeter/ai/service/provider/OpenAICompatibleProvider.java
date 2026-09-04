@@ -642,7 +642,7 @@ public class OpenAICompatibleProvider implements AiService {
             case "high" -> ReasoningEffort.HIGH;
             case "xhigh" -> ReasoningEffort.XHIGH;
             case "max" -> ReasoningEffort.MAX;
-            default -> ReasoningEffort.MEDIUM;
+            default -> ReasoningEffort.HIGH;
         };
     }
 }

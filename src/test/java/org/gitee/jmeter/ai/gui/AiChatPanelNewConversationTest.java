@@ -477,7 +477,7 @@ class AiChatPanelNewConversationTest {
 
     /**
      * 排队中的回合被重置取消（pre-pickup）时，其队列消息全部 ack 于
-     * 重置之前（cancelRouting 与 offer 在 CHM bin 锁下互斥，翻转后无新 offer）——
+     * 重置之前（closeRouting 与 offer 在 CHM bin 锁下互斥，翻转后无新 offer）——
      * 死任务的 guard 善后必须按<b>提交时</b>代数比对丢弃。缺陷：guard 在 pickup 时
      * 读 currentEpoch（已被重置翻转），自己跟自己比恒过，旧会话残留被 re-publish
      * 成新会话回合（渲染+落盘）。

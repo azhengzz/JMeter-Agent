@@ -194,12 +194,12 @@ class IpcServerAgentTimeoutRaceTest {
                     "precondition: turn must still be in flight inside the race window");
 
             // 窗口内让回合自然完整完成（生产对应：最后一次 LLM 返回恰落在该窗口——
-            // emitTerminal 发 TURN_COMPLETED、jsonl 落盘、future.complete、whenComplete 摘表）
+            // emitTerminal 发 TURN_COMPLETED、jsonl 落盘、future.complete、收尾 finally 摘表）
             llmCall.release.countDown();
 
-            // 锚点 3（确定性）：future 正常完成 + whenComplete 收尾完毕——
-            // waitForCancellation 等的 completionLatches 在 whenComplete 里先摘后数，
-            // 返回 true 即「摘表/倒数均已完成」，此后 signalCancel 必然空转
+            // 锚点 3（确定性）：future 正常完成 + 收尾 finally 完毕——
+            // waitForCancellation 等的 completionLatch 在任务体外层 finally 里
+            // 先按值摘表再倒数，返回 true 即「摘表/倒数均已完成」，此后 signalCancel 必然空转
             AwaitUtil.awaitUntil(
                     () -> turnFuture.isDone() && !turnFuture.isCompletedExceptionally(),
                     "the turn must complete normally inside the race window");
@@ -215,8 +215,8 @@ class IpcServerAgentTimeoutRaceTest {
                     "the no-op cancel must not raise TURN_CANCELLED for a completed turn");
             assertEquals("TIMEOUT-RACE-FINAL", recorder.lastCompleted().response().getContent());
 
-            // 放行取消：super.cancelActiveTask 空转（activeTasks/abortFlags/activeTurnHandles
-            // 已被 whenComplete 按值摘除 → signalCancel 返回 false、无 TURN_CANCELLED）
+            // 放行取消：super.cancelActiveTask 空转（注册表条目已被收尾 finally 的
+            // removeIfCurrent 按值摘除 → signalCancel 返回 false、无 TURN_CANCELLED）
             loop.cancelProceed.countDown();
 
             HttpResponse<byte[]> raw = httpFuture.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);

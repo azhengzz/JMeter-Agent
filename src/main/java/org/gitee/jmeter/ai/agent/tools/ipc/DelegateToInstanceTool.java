@@ -39,7 +39,8 @@ import java.util.Map;
  *       挡住委派链经<u>空闲</u>实例不断延长(A→B→C→D…每跳合法、每跳阻塞满
  *       {@code jmeter.ai.ipc.agent.timeout.ms} 且深度无界)。</li>
  *   <li><b>接收侧 delegated-busy 兜底</b>:目标实例此刻已有未完成回合占用其单槽
- *       ({@code activeTasks} 非空,不一定是委派回合)时,新委派快速失败报 "session busy",
+ *       ({@code AgentLoop.hasActiveRun} 为真,注入路由槽存在,不一定是委派回合)时,
+ *       新委派快速失败报 "session busy",
  *       避免同一实例并发执行多个回合。这是并发碰撞的保护,与委派链的线性/环状形状无关。</li>
  * </ol>
  *

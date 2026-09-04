@@ -214,6 +214,16 @@ class EventParityTest {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
+            // signalCancel 第 2 步的 interrupt 先于第 3 步 cancel：单次停等被 interrupt
+            // 唤醒后整回合可在两步间隙自然完成并认领终态（[started, completed]，负载
+            // 相关偶然）。此处再停一门——回合只能被 cancel(true) 的第二次 interrupt
+            // 放行，[interrupt → cancel] 窗口内 future 恒未完成，cancel 必胜、终态必为
+            // TURN_CANCELLED（断言不变，仅消除 fake 的调度竞态）。
+            try {
+                Thread.sleep(Long.MAX_VALUE);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
             return LLMResponse.text("cancelled-final");
         };
         CompletableFuture<AgentResponse> future = loop.processMessage(

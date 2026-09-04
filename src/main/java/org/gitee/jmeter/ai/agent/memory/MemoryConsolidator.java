@@ -84,15 +84,17 @@ public class MemoryConsolidator {
      * Entry guard: skip if memory store disabled, or estimated tokens within budget.
      * Loop: archive old messages until estimated tokens <= target (budget / 2).
      *
-     * <p>同步方法,内联跑在 AgentRunner run 任务线程上——两个调用方(前置/后置整合)都需要
+     * <p>同步方法,内联跑在 AgentRunner 的 run 执行线程上——两个调用方(前置/后置整合)都需要
      * 在回合推进前拿到结果:前置推进 {@code lastConsolidatedIndex} 决定本轮上下文,后置必须
-     * 先于 run future 完成落地(防僵尸回合写盘)。取消事实来源是共享 abort flag:
+     * 先于回合 future 完成落地(防僵尸回合写盘;run() 同步直调,回合 future 在 run() 返回后
+     * 才 complete)。取消事实来源是共享 abort flag:
      * {@code signalCancel} 先置 flag 再 interrupt,故 interrupt 落在任何阶段(等锁 sleep /
      * LLM 调用)都收敛到与 flag 相同的"不落盘"结局。每轮开始前轮询 {@code aborted},配合
      * {@link #consolidateWithAi(List, BooleanSupplier)} 写盘前检查,让被取消的回合不再写
      * HISTORY/MEMORY/session,避免与关闭对话框的深度提炼 + 清会话竞态。
      *
-     * @param aborted 为 true 时本轮立即停止;调用方传 {@code () -> spec 的 abort flag}
+     * @param aborted 为 true 时本轮立即停止;调用方传 {@code () -> isAborted(spec)}
+     *                 (flag + 中断位,均在 run 执行线程上求值)
      */
     public void maybeConsolidate(Session session, BooleanSupplier aborted) {
         if (!memoryStore.isEnabled()) {
@@ -246,8 +248,11 @@ public class MemoryConsolidator {
     }
 
     /**
-     * {@link #consolidateWithAi(List)} 的取消感知变体。LLM 调用在池化载体线程上执行,
-     * 关闭期 cancelActiveTask 只能置 abort flag、无法打断这个调用;因此本方法只在
+     * {@link #consolidateWithAi(List)} 的取消感知变体。LLM 调用所在线程随调用路径而异:
+     * {@code distillSync}/{@code archiveMessagesAsync} 跑在 commonPool 载体上,关闭期
+     * cancelActiveTask 只能置 abort flag、无法打断该调用;{@code maybeConsolidate} 路径
+     * 内联在 run 执行线程上,interrupt 可达——但 signalCancel 先置 flag 再 interrupt,
+     * 两者收敛到同一"不落盘"结局。因此本方法只在
      * <b>写盘前</b>检查 {@code aborted}——被取消的僵尸回合在 LLM 返回后、写 HISTORY/MEMORY 前
      * 直接放弃落盘(返回 false),不覆盖用户等待的关闭提炼结果。
      *

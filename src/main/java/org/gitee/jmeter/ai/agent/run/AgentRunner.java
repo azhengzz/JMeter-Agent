@@ -52,9 +52,6 @@ public class AgentRunner {
     private final int defaultMaxIterations;
     private final long toolTimeoutMs;
 
-    // Track the thread running the agent loop so Stop button can interrupt it
-    private volatile Thread runningThread;
-
     /**
      * Create an AgentRunner.
      */
@@ -87,123 +84,128 @@ public class AgentRunner {
     }
 
     /**
-     * Run an agent with the given specification.
+     * Run an agent with the given specification. Synchronous: executes inline on
+     * the calling thread (main link = single-threaded agent-loop executor thread,
+     * subagent = subagent pool thread) and returns the result directly — the LLM
+     * loop and both consolidations share that one thread, which is exactly what
+     * the callers' interrupt targets ({@code Turn.runnerThread} on the main link,
+     * {@code RunningSubagent.runThread} for subagents).
      */
-    public CompletableFuture<AgentRunResult> run(AgentRunSpec spec) {
-        java.util.function.Supplier<AgentRunResult> task = () -> {
-            String runId = DEFAULT_RUN_ID_PREFIX + java.util.UUID.randomUUID().toString().substring(0, 8);
-            Instant startTime = Instant.now();
+    public AgentRunResult run(AgentRunSpec spec) {
+        String runId = DEFAULT_RUN_ID_PREFIX + java.util.UUID.randomUUID().toString().substring(0, 8);
+        Instant startTime = Instant.now();
 
-            // Track this thread from the very start of the run — NOT only inside
-            // runAgentLoop — so Stop/cancel can interrupt the pre-loop consolidation
-            // window too (interrupt() targets runningThread, which is null until
-            // the run task starts otherwise).
-            runningThread = Thread.currentThread();
-            // 载体线程是池化的:上一轮被 Stop 取消的回合,其 interrupt() 可能晚于 finally 的
-            // Thread.interrupted() 才送达(interrupt() 读→log→interrupt 的 TOCTOU 窗口),
-            // 在复用载体上留下残留中断。入口处清一次,避免这一轮
-            // 一进 while 迭代 1 就因 isInterrupted() 直接 break 返回空回复。取消语义不受影响:
-            // signalCancel 先置 abort flag 再 interrupt,flag 才是取消的唯一事实来源。
+        // 执行线程是跨回合复用的:主链路的 agent-loop 专用线程串行跑所有回合,子代理线程
+        // 来自固定大小的池。上一回合被 Stop 取消时,signalCancel 的 runnerThread 中断
+        // 可能晚于上一回合 finally 的 Thread.interrupted() 清扫才送达(读→interrupt 的
+        // TOCTOU 窗口),在复用线程上留下残留——入口处清一次,避免这一轮一进 while
+        // 迭代 1 就因 isInterrupted() 直接 break 返回空回复。取消语义不受影响:
+        // signalCancel 先置 abort flag 再 interrupt,flag 才是取消的唯一事实来源。
+        Thread.interrupted();
+
+        // Bind the run identity so tools (e.g. spawn) can learn their session.
+        AgentRunContext.set(new AgentRunContext(spec.getSessionKey(), runId));
+        // isDelegated() == true 标识"当前这一个 Agent 回合是被别的实例委派过来的"，
+        // DelegationGuard.begin() 在这个回合的执行线程上做一个 ThreadLocal 标记，
+        // 用于禁止这个回合里再往别的实例委派（深度 1 硬阻断）。
+        // 工具 DelegateToInstanceTool 在委派前会判单该标识。
+        if (spec.isDelegated()) {
+            DelegationGuard.begin();
+        }
+        try {
+            log.info("Starting agent run {} for session: {}", runId, spec.getSessionKey());
+
+            // Subagent runs stay fully ephemeral: never touch SessionManager, so
+            // nothing about them can reach the main session's jsonl.
+            Session session = spec.isPersistSession()
+                ? sessionManager.getOrCreate(spec.getSessionKey())
+                : new Session(spec.getSessionKey());
+
+            // Check memory consolidation (Nanobot: maybe_consolidate_by_tokens [sync]).
+            // Runs inline on this run thread; the cancel truth is the shared abort flag —
+            // signalCancel sets the flag BEFORE interrupt, so an interrupt landing inside
+            // the lock wait or the LLM call converges to the same no-write outcome as the
+            // flag (spec's flag IS the one the cancelActiveTask map holds). Declared
+            // once, reused by the post-loop call below. Interrupt-inclusive on purpose:
+            // every evaluator (here, the post-loop call, saveMessagesToSession's
+            // rechecks, lockLongTermMemory 的 abort 感知等锁轮询) runs on this run
+            // thread where the bit is meaningful, and all interrupt sources set the
+            // flag first — the bit only ever adds conservatism for residual interrupts.
+            BooleanSupplier abortSignal = () -> isAborted(spec);
+            if (spec.isPersistSession()) {
+                memoryConsolidator.maybeConsolidate(session, abortSignal);
+            }
+
+            // Create hook context
+            AgentHookContext context = new AgentHookContext(runId, session, spec.getUserMessage());
+
+            // Build initial messages (getHistory now returns only unconsolidated messages)
+            List<Message> messages;
+            if (spec.getInitialMessages() != null && !spec.getInitialMessages().isEmpty()) {
+                messages = new ArrayList<>(spec.getInitialMessages());
+            } else {
+                messages = contextBuilder.buildMessages(
+                    session.getHistory(AiConfig.getMaxHistorySize()),
+                    spec.getUserMessage(),
+                    toolRegistry.getToolDefinitions()
+                );
+            }
+
+            // Run agent loop
+            AgentRunResult result = runAgentLoop(messages, session, spec, context, startTime);
+
+            // Skip session persistence if task was cancelled (Nanobot: CancelledError skips session.save)
+            // and always skip it for ephemeral subagent runs.
+            if (spec.isPersistSession() && !isAborted(spec)) {
+                int skipCount = Math.max(0, messages.size() - 1);
+                saveMessagesToSession(session, result.getCurrentMessages(), skipCount, abortSignal);
+                // 后置整合必须同步内联、跑在 run 执行线程上,不能丢到后台线程。前提:
+                // 回合 future 一旦 complete,AgentLoop.whenComplete 会立即把本回合的 abort
+                // flag 从 map 移除,cancelActiveTask 靠查这个 map 才能取消一个回合。
+                //
+                // 时序保证:run() 同步直调,回合 future 在 run() 返回后才 complete →
+                // 整合(在 run() 内)必然先于 future complete 跑完,whenComplete 移除 flag
+                // 必然发生在整合之后 → 关闭期间 cancelActiveTask 一直能找到这个 flag,
+                // 整合可被正常取消。若丢到后台线程,flag 可能先被移除,整合就成了取消不到的
+                // "僵尸回合",关闭时照常写盘,与关闭对话框的深度提炼抢写 HISTORY/MEMORY
+                // (重复条目、后写覆盖)。
+                //
+                // 取消兜底:整合等锁/写盘前都查 abortSignal(flag+中断,均在 run 执行线程求值),
+                // 被取消则不落盘,与前置整合一致。
+                memoryConsolidator.maybeConsolidate(session, abortSignal);
+            }
+
+            log.info("Agent run {} completed with success={}", runId, result.isSuccess());
+            return result;
+
+        } catch (Exception e) {
+            log.error("Agent run " + runId + " failed", e);
+            return AgentRunResult.builder()
+                .runId(runId)
+                .success(false)
+                .errorMessage(e.getMessage())
+                .startTime(startTime)
+                .endTime(Instant.now())
+                .build();
+        } finally {
+            // The run thread is reused (agent-loop dedicated thread across turns /
+            // pooled subagent thread): clear the guard so a later run on this
+            // thread is not wrongly blocked from delegating.
+            DelegationGuard.end();
+            // Same thread-reuse reasoning: a stale context would misroute a
+            // later subagent result into the wrong session.
+            AgentRunContext.clear();
+            // Consume an interrupt raised to abort this run, so the reused thread
+            // does not hand it to the next run (which would bail at iteration 1
+            // and answer with nothing). ORDERING INVARIANT: this sweep must stay
+            // AFTER the persistence chain has read the interrupt bit — the guard
+            // `spec.isPersistSession() && !isAborted(spec)` and, under it, the
+            // abortSignal rechecks (saveMessagesToSession、lockLongTermMemory 等锁
+            // 轮询) all evaluate isAborted on this thread. Sweeping earlier would
+            // wash an interrupted run into "completed" and let a half-finished
+            // turn be written to the session.
             Thread.interrupted();
-
-            // Bind the run identity so tools (e.g. spawn) can learn their session.
-            AgentRunContext.set(new AgentRunContext(spec.getSessionKey(), runId));
-            // isDelegated() == true 标识"当前这一个 Agent 回合是被别的实例委派过来的"，
-            // DelegationGuard.begin() 在这个回合的执行线程上做一个 ThreadLocal 标记，
-            // 用于禁止这个回合里再往别的实例委派（深度 1 硬阻断）。
-            // 工具 DelegateToInstanceTool 在委派前会判单该标识。
-            if (spec.isDelegated()) {
-                DelegationGuard.begin();
-            }
-            try {
-                log.info("Starting agent run {} for session: {}", runId, spec.getSessionKey());
-
-                // Subagent runs stay fully ephemeral: never touch SessionManager, so
-                // nothing about them can reach the main session's jsonl.
-                Session session = spec.isPersistSession()
-                    ? sessionManager.getOrCreate(spec.getSessionKey())
-                    : new Session(spec.getSessionKey());
-
-                // Check memory consolidation (Nanobot: maybe_consolidate_by_tokens [sync]).
-                // Runs inline on this run thread; the cancel truth is the shared abort flag —
-                // signalCancel sets the flag BEFORE interrupt, so an interrupt landing inside
-                // the lock wait or the LLM call converges to the same no-write outcome as the
-                // flag (spec's flag IS the one the cancelActiveTask map holds). The supplier
-                // is flag-only and declared once, reused by the post-loop call below.
-                BooleanSupplier abortSignal = () -> isAbortedFlag(spec);
-                if (spec.isPersistSession()) {
-                    memoryConsolidator.maybeConsolidate(session, abortSignal);
-                }
-
-                // Create hook context
-                AgentHookContext context = new AgentHookContext(runId, session, spec.getUserMessage());
-
-                // Build initial messages (getHistory now returns only unconsolidated messages)
-                List<Message> messages;
-                if (spec.getInitialMessages() != null && !spec.getInitialMessages().isEmpty()) {
-                    messages = new ArrayList<>(spec.getInitialMessages());
-                } else {
-                    messages = contextBuilder.buildMessages(
-                        session.getHistory(AiConfig.getMaxHistorySize()),
-                        spec.getUserMessage(),
-                        toolRegistry.getToolDefinitions()
-                    );
-                }
-
-                // Run agent loop
-                AgentRunResult result = runAgentLoop(messages, session, spec, context, startTime);
-
-                // Skip session persistence if task was cancelled (Nanobot: CancelledError skips session.save)
-                // and always skip it for ephemeral subagent runs.
-                if (spec.isPersistSession() && !isAborted(spec)) {
-                    int skipCount = Math.max(0, messages.size() - 1);
-                    saveMessagesToSession(session, result.getCurrentMessages(), skipCount, abortSignal);
-                    // 后置整合必须同步内联、跑在 run 任务线程上,不能丢到后台线程。前提:
-                    // run future 一旦 complete,AgentLoop.whenComplete 会立即把本回合的 abort
-                    // flag 从 map 移除,cancelActiveTask 靠查这个 map 才能取消一个回合。
-                    //
-                    // 时序保证:整合和回合同线程、顺序执行 → 整合必然在 future complete 之前
-                    // 跑完,whenComplete 移除 flag 必然发生在整合之后 → 关闭期间 cancelActiveTask
-                    // 一直能找到这个 flag,整合可被正常取消。若丢到后台线程,flag 可能先被移除,
-                    // 整合就成了取消不到的"僵尸回合",关闭时照常写盘,与关闭对话框的深度提炼
-                    // 抢写 HISTORY/MEMORY(重复条目、后写覆盖)。
-                    //
-                    // 取消兜底:整合等锁/写盘前都查 abortSignal 共享 flag,被取消则不落盘,与前置整合一致。
-                    memoryConsolidator.maybeConsolidate(session, abortSignal);
-                }
-
-                log.info("Agent run {} completed with success={}", runId, result.isSuccess());
-                return result;
-
-            } catch (Exception e) {
-                log.error("Agent run " + runId + " failed", e);
-                return AgentRunResult.builder()
-                    .runId(runId)
-                    .success(false)
-                    .errorMessage(e.getMessage())
-                    .startTime(startTime)
-                    .endTime(Instant.now())
-                    .build();
-            } finally {
-                // Pooled carrier thread: clear the guard so a later run on this
-                // thread is not wrongly blocked from delegating.
-                DelegationGuard.end();
-                // Carrier threads are pooled — a stale context would misroute a
-                // later subagent result into the wrong session.
-                AgentRunContext.clear();
-                // runningThread cleanup moved to the run task (set at task start, cleared
-                // here in the same finally) — covers the pre-loop consolidation window too.
-                runningThread = null;
-                // Consume an interrupt raised to abort this run, so the pooled carrier
-                // does not hand it to the next run (which would bail at iteration 1 and
-                // answer with nothing). Cleared only here, AFTER the persistence guard
-                // above has read it — clearing it earlier would let an interrupted,
-                // half-finished turn be written to the session.
-                Thread.interrupted();
-            }
-        };
-
-        return CompletableFuture.supplyAsync(task);
+        }
     }
 
     /**
@@ -275,6 +277,36 @@ public class AgentRunner {
     }
 
     /**
+     * runAgentLoop 单次运行的共享可变状态（design D4）：while 体、两大分支方法与注入
+     * 检查点都读写这里的字段，替代原先散落在巨方法体内的局部变量。可变字段仅在 run
+     * 执行线程上触碰（run 同步直调，无跨线程发布）。
+     */
+    private static final class LoopState {
+        List<Message> currentMessages;
+        String finalContent;
+        int iteration;
+        int injectionCycles;
+        boolean hadInjections;
+        final List<String> toolsUsed = new ArrayList<>();
+        final AgentHook hook;
+        final LlmCallOptions llmOptions;
+        final int maxIterations;
+
+        LoopState(List<Message> messages, AgentRunSpec spec, int defaultMaxIterations) {
+            this.currentMessages = new ArrayList<>(messages);
+            this.hook = spec.getHook();
+            // Build per-run LLM options from spec overrides
+            this.llmOptions = LlmCallOptions.builder()
+                .model(spec.getModel())
+                .temperature(spec.getTemperature())
+                .maxTokens(spec.getMaxTokens())
+                .reasoningEffort(spec.getReasoningEffort())
+                .build();
+            this.maxIterations = spec.getMaxIterations() > 0 ? spec.getMaxIterations() : defaultMaxIterations;
+        }
+    }
+
+    /**
      * Run the main agent iteration loop.
      */
     private AgentRunResult runAgentLoop(
@@ -284,29 +316,7 @@ public class AgentRunner {
             AgentHookContext context,
             Instant startTime) {
 
-        // runningThread 的职责边界:它由外层 run 任务在开头设置(见 run() 内 runningThread =
-        // Thread.currentThread())、在任务的 finally 里清除,runAgentLoop 对这个字段只是只读。
-        // 把设置提前到 run 任务开头而非此处的原因:runAgentLoop 被调用之前还有一段"前置记忆
-        // 整合"的窗口,runningThread 若此时还是 null,cancel/interrupt 就够不到正在跑前置整合
-        // 的线程。runAgentLoop 本身内联跑在 run 任务那条载体线程上,不自己管这个字段——这里
-        // 无论如何赋值/清空都会破坏上面的窗口覆盖,所以不要在这里动它。
-        {
-        List<Message> currentMessages = new ArrayList<>(messages);
-        List<String> toolsUsed = new ArrayList<>();
-        String finalContent = null;
-        int maxIterations = spec.getMaxIterations() > 0 ? spec.getMaxIterations() : defaultMaxIterations;
-        int iteration = 0;
-        int injectionCycles = 0;
-        boolean hadInjections = false;
-        AgentHook hook = spec.getHook();
-
-        // Build per-run LLM options from spec overrides
-        LlmCallOptions llmOptions = LlmCallOptions.builder()
-            .model(spec.getModel())
-            .temperature(spec.getTemperature())
-            .maxTokens(spec.getMaxTokens())
-            .reasoningEffort(spec.getReasoningEffort())
-            .build();
+        LoopState state = new LoopState(messages, spec, defaultMaxIterations);
 
         // Fail fast: tool calling is mandatory for the agent. A service that does not
         // support tool calling must NOT silently degrade to a tool-less text loop.
@@ -322,52 +332,52 @@ public class AgentRunner {
             return AgentRunResult.builder()
                 .runId(context.getRunId())
                 .content(unsupportedMsg)
-                .toolsUsed(toolsUsed)
-                .iterationCount(iteration)
+                .toolsUsed(state.toolsUsed)
+                .iterationCount(state.iteration)
                 .success(true)
                 .startTime(startTime)
                 .endTime(Instant.now())
                 .session(session)
                 .toolEvents(context.getToolEvents())
-                .currentMessages(currentMessages)
+                .currentMessages(state.currentMessages)
                 .metadata(errMeta)
                 .stopReason(context.getStopReason())
-                .hadInjections(hadInjections)
+                .hadInjections(state.hadInjections)
                 .build();
         }
 
-        while (iteration < maxIterations) {
-            iteration++;
-            context.setCurrentIteration(iteration);
+        while (state.iteration < state.maxIterations) {
+            state.iteration++;
+            context.setCurrentIteration(state.iteration);
 
             // Check abort flag (set by cancellation) and thread interrupt
             if (isAborted(spec)) {
-                log.info("Agent loop aborted at iteration {} for session {}", iteration, spec.getSessionKey());
+                log.info("Agent loop aborted at iteration {} for session {}", state.iteration, spec.getSessionKey());
                 break;
             }
 
-            if (hook != null) hook.beforeIteration(context);
+            if (state.hook != null) state.hook.beforeIteration(context);
 
             // Check for iteration limit
-            if (iteration > 1) {
-                log.info("Iteration {}", iteration);
+            if (state.iteration > 1) {
+                log.info("Iteration {}", state.iteration);
             }
 
             // Check abort before making LLM call (avoid wasting tokens if already stopped)
             if (isAborted(spec)) {
-                log.info("Agent loop aborted before LLM call at iteration {} for session {}", iteration, spec.getSessionKey());
+                log.info("Agent loop aborted before LLM call at iteration {} for session {}", state.iteration, spec.getSessionKey());
                 break;
             }
 
             // Call LLM — govern context first: trim a per-iteration copy if over budget.
             // currentMessages (the persisted conversation) is never mutated by govern.
-            List<Message> messagesForModel = contextWindowManager.govern(currentMessages, spec.getMaxTokens());
-            LLMResponse response = callLLM(messagesForModel, llmOptions);
+            List<Message> messagesForModel = contextWindowManager.govern(state.currentMessages, spec.getMaxTokens());
+            LLMResponse response = callLLM(messagesForModel, state.llmOptions);
             context.setLastLlmResponse(response);
 
             // Check abort after LLM call returns
             if (isAborted(spec)) {
-                log.info("Agent loop aborted after LLM call at iteration {}", iteration);
+                log.info("Agent loop aborted after LLM call at iteration {}", state.iteration);
                 break;
             }
 
@@ -379,178 +389,55 @@ public class AgentRunner {
 
             if (response.isError()) {
                 if ("Interrupted".equals(response.getErrorMessage())) {
-                    log.info("Agent loop aborted during LLM call at iteration {}", iteration);
+                    log.info("Agent loop aborted during LLM call at iteration {}", state.iteration);
                     break;
                 }
                 log.error("LLM returned error: {}", response.getErrorMessage());
-                finalContent = "I encountered an error: " + response.getErrorMessage();
-                if (hook != null) hook.onError(new RuntimeException(response.getErrorMessage()), context);
+                state.finalContent = "I encountered an error: " + response.getErrorMessage();
+                if (state.hook != null) {
+                    state.hook.onError(new RuntimeException(response.getErrorMessage()), context);
+                }
 
                 // Injection check 4: after LLM error
-                InjectionResult inj4 = tryDrainInjections(currentMessages, spec, injectionCycles);
-                injectionCycles = inj4.injectionCycle;
-                hadInjections |= inj4.hadInjections;
-                if (inj4.shouldContinue) {
-                        if (hook != null) hook.afterIteration(context);
-                        continue;
-                    }
+                if (checkpoint(state, spec)) {
+                    if (state.hook != null) state.hook.afterIteration(context);
+                    continue;
+                }
                 break;
             }
 
             // Check for tool calls
             if (response.hasToolCalls()) {
-                // Add assistant message with tool calls
-                currentMessages = contextBuilder.addAssistantMessage(
-                    currentMessages,
-                    response.getContent(),
-                    response.getToolCalls(),
-                    response.getReasoningContent()
-                );
-
-                if (hook != null) hook.beforeExecuteTools(response.getToolCalls(), context);
-
-                // Check abort before executing tools
-                if (isAborted(spec)) {
-                    log.info("Agent loop aborted before tool execution at iteration {}", iteration);
-                    break;
-                }
-
-                // Execute tools (concurrency-safe batches run in parallel; unsafe calls inline)
-                ToolExecutionResult executionResult = executeToolCalls(
-                    response.getToolCalls()
-                );
-                List<ToolResult> toolResults = executionResult.results;
-                List<org.gitee.jmeter.ai.agent.model.ToolEvent> toolEvents = executionResult.events;
-
-                context.setLastToolResults(toolResults);
-                // Add tool events to context
-                for (var event : toolEvents) {
-                    context.addToolEvent(event);
-                }
-
-                // Check for tool errors if failOnToolError is enabled
-                if (spec.isFailOnToolError()) {
-                    List<org.gitee.jmeter.ai.agent.model.ToolEvent> failedEvents = toolEvents.stream()
-                            .filter(org.gitee.jmeter.ai.agent.model.ToolEvent::isError)
-                            .toList();
-                    if (!failedEvents.isEmpty()) {
-                        String error = failedEvents.stream()
-                                .map(e -> e.getToolName() + ": " + e.getDetail())
-                                .collect(Collectors.joining("; "));
-                        log.error("Tool execution failed (failOnToolError=true): {}", error);
-                        context.setError("Tool execution failed: " + error);
-                        context.setStopReason("tool_error");
-                        if (hook != null) hook.afterIteration(context);
-                        finalContent = "Error: Tool execution failed: " + error;
-
-                        // Injection check 3: after tool fatal error
-                        InjectionResult inj3 = tryDrainInjections(currentMessages, spec, injectionCycles);
-                        injectionCycles = inj3.injectionCycle;
-                        hadInjections |= inj3.hadInjections;
-                        if (inj3.shouldContinue) continue;
-                        break;
-                    }
-                }
-
-                if (hook != null) hook.afterExecuteTools(response.getToolCalls(), context);
-
-                // Check abort after tool execution
-                if (isAborted(spec)) {
-                    log.info("Agent loop aborted after tool execution at iteration {}", iteration);
-                    break;
-                }
-
-                // Add tool results to messages
-                for (int i = 0; i < response.getToolCalls().size(); i++) {
-                    ToolCall call = response.getToolCalls().get(i);
-                    if (i < toolResults.size()) {
-                        currentMessages = contextBuilder.addToolResult(
-                            currentMessages,
-                            call.getId(),
-                            call.getName(),
-                            toolResults.get(i).getResult()
-                        );
-                    }
-                }
-
-                // Track tools used
-                List<String> iterationTools = response.getToolCalls().stream()
-                    .map(ToolCall::getName)
-                    .collect(Collectors.toList());
-                toolsUsed.addAll(iterationTools);
-                for (String toolName : iterationTools) {
-                    context.addToolUsed(toolName);
-                }
-
-                // Injection check 1: after tool execution, before next LLM call
-                InjectionResult inj1 = tryDrainInjections(currentMessages, spec, injectionCycles);
-                injectionCycles = inj1.injectionCycle;
-                hadInjections |= inj1.hadInjections;
-                if (inj1.shouldContinue) {
-                    if (hook != null) hook.afterIteration(context);
-                    continue;
-                }
-
-            } else {
-                // No tool calls, this is the final response
-                finalContent = response.getContent();
-
-                // Injection check 5: empty response
-                if (finalContent == null || finalContent.isEmpty()) {
-                    InjectionResult inj5 = tryDrainInjections(currentMessages, spec, injectionCycles);
-                    injectionCycles = inj5.injectionCycle;
-                    hadInjections |= inj5.hadInjections;
-                    if (inj5.shouldContinue) {
-                        if (hook != null) hook.afterIteration(context);
-                        continue;
-                    }
-                    // No injections and empty → append placeholder and break
-                }
-
-                // Append assistant message before checking for injections,
-                // so role alternation is preserved: assistant → user(injected).
-                currentMessages = contextBuilder.addAssistantMessage(
-                    currentMessages, finalContent, null, response.getReasoningContent());
-
-                // Injection check 2: after final response
-                InjectionResult inj2 = tryDrainInjections(currentMessages, spec, injectionCycles);
-                injectionCycles = inj2.injectionCycle;
-                hadInjections |= inj2.hadInjections;
-                if (inj2.shouldContinue) {
-                    if (hook != null) {
-                        hook.onIntermediateResponse(finalContent, context);
-                    }
-                    finalContent = null;
-                    if (hook != null) hook.afterIteration(context);
-                    continue;
-                }
-
+                if (handleToolCallsBranch(response, state, spec, context)) continue;
                 break;
             }
 
-            if (hook != null) hook.afterIteration(context);
+            if (handleFinalResponseBranch(response, state, spec, context)) continue;
+            break;
         }
 
         // Check max iterations
-        if (finalContent == null && iteration >= maxIterations) {
-            log.warn("Max iterations reached: {}", maxIterations);
+        if (state.finalContent == null && state.iteration >= state.maxIterations) {
+            log.warn("Max iterations reached: {}", state.maxIterations);
 
-            // Injection drain 6: after max iterations (drain only, don't continue loop)
+            // Injection drain 6: after max iterations (drain only, don't continue loop).
+            // 手写保留、不走 checkpoint(design D4):此处绕过 MAX_INJECTION_CYCLES 上限、
+            // 直接 append、永不 continue——已用满 5 周期后打到 maxIterations 的场景仍须抽干。
             if (spec.getInjectionCallback() != null) {
                 List<String> remaining = spec.getInjectionCallback().apply(MAX_INJECTIONS_PER_TURN);
                 if (remaining != null && !remaining.isEmpty()) {
-                    hadInjections = true;
-                    appendInjectedMessages(currentMessages, remaining);
+                    state.hadInjections = true;
+                    appendInjectedMessages(state.currentMessages, remaining);
                     log.info("Drained {} remaining injected messages after max iterations", remaining.size());
                 }
             }
 
-            finalContent = "I reached the maximum number of tool call iterations. Please try breaking the task into smaller steps.";
+            state.finalContent = "I reached the maximum number of tool call iterations. Please try breaking the task into smaller steps.";
         }
 
         // Finalize content through hook
-        if (hook != null) {
-            finalContent = hook.finalizeContent(finalContent, context);
+        if (state.hook != null) {
+            state.finalContent = state.hook.finalizeContent(state.finalContent, context);
         }
 
         // Build result
@@ -559,20 +446,177 @@ public class AgentRunner {
 
         return AgentRunResult.builder()
             .runId(context.getRunId())
-            .content(finalContent)
-            .toolsUsed(toolsUsed)
-            .iterationCount(iteration)
+            .content(state.finalContent)
+            .toolsUsed(state.toolsUsed)
+            .iterationCount(state.iteration)
             .success(true)
             .startTime(startTime)
             .endTime(Instant.now())
             .session(session)
             .toolEvents(context.getToolEvents())
-            .currentMessages(currentMessages)
+            .currentMessages(state.currentMessages)
             .metadata(resultMetadata)
             .stopReason(context.getStopReason())
-            .hadInjections(hadInjections)
+            .hadInjections(state.hadInjections)
             .build();
+    }
+
+    /**
+     * while 体的工具调用分支（含 inj1/inj3 两个注入检查点）。返回 shouldContinue：
+     * true = 回到循环条件继续迭代——含 inj1 无注入时的自然落穿路径（此时本方法已发射
+     * 原循环体尾部的 afterIteration，那个位置只有工具分支可达）；false = break 出循环
+     * （执行前/后中止、致命工具错误后无注入）。
+     */
+    private boolean handleToolCallsBranch(
+            LLMResponse response, LoopState state, AgentRunSpec spec, AgentHookContext context) {
+
+        // Add assistant message with tool calls
+        state.currentMessages = contextBuilder.addAssistantMessage(
+            state.currentMessages,
+            response.getContent(),
+            response.getToolCalls(),
+            response.getReasoningContent()
+        );
+
+        if (state.hook != null) state.hook.beforeExecuteTools(response.getToolCalls(), context);
+
+        // Check abort before executing tools
+        if (isAborted(spec)) {
+            log.info("Agent loop aborted before tool execution at iteration {}", state.iteration);
+            return false;
         }
+
+        // Execute tools (concurrency-safe batches run in parallel; unsafe calls inline)
+        ToolExecutionResult executionResult = executeToolCalls(
+            response.getToolCalls()
+        );
+        List<ToolResult> toolResults = executionResult.results;
+        List<org.gitee.jmeter.ai.agent.model.ToolEvent> toolEvents = executionResult.events;
+
+        context.setLastToolResults(toolResults);
+        // Add tool events to context
+        for (var event : toolEvents) {
+            context.addToolEvent(event);
+        }
+
+        // Check for tool errors if failOnToolError is enabled
+        if (spec.isFailOnToolError()) {
+            List<org.gitee.jmeter.ai.agent.model.ToolEvent> failedEvents = toolEvents.stream()
+                    .filter(org.gitee.jmeter.ai.agent.model.ToolEvent::isError)
+                    .toList();
+            if (!failedEvents.isEmpty()) {
+                String error = failedEvents.stream()
+                        .map(e -> e.getToolName() + ": " + e.getDetail())
+                        .collect(Collectors.joining("; "));
+                log.error("Tool execution failed (failOnToolError=true): {}", error);
+                context.setError("Tool execution failed: " + error);
+                context.setStopReason("tool_error");
+                // 块内 hook 变体：afterIteration 在检查点之前发射——inj3 的 continue 路径
+                // 因此不再补发射（与 inj1/4/5 不同）
+                if (state.hook != null) state.hook.afterIteration(context);
+                state.finalContent = "Error: Tool execution failed: " + error;
+
+                // Injection check 3: after tool fatal error
+                return checkpoint(state, spec);
+            }
+        }
+
+        if (state.hook != null) state.hook.afterExecuteTools(response.getToolCalls(), context);
+
+        // Check abort after tool execution
+        if (isAborted(spec)) {
+            log.info("Agent loop aborted after tool execution at iteration {}", state.iteration);
+            return false;
+        }
+
+        // Add tool results to messages
+        for (int i = 0; i < response.getToolCalls().size(); i++) {
+            ToolCall call = response.getToolCalls().get(i);
+            if (i < toolResults.size()) {
+                state.currentMessages = contextBuilder.addToolResult(
+                    state.currentMessages,
+                    call.getId(),
+                    call.getName(),
+                    toolResults.get(i).getResult()
+                );
+            }
+        }
+
+        // Track tools used
+        List<String> iterationTools = response.getToolCalls().stream()
+            .map(ToolCall::getName)
+            .collect(Collectors.toList());
+        state.toolsUsed.addAll(iterationTools);
+        for (String toolName : iterationTools) {
+            context.addToolUsed(toolName);
+        }
+
+        // Injection check 1: after tool execution, before next LLM call
+        if (checkpoint(state, spec)) {
+            if (state.hook != null) state.hook.afterIteration(context);
+            return true;
+        }
+
+        // inj1 无注入的自然落穿：原循环体尾部的 afterIteration 只有工具分支可达，
+        // 在此发射后交回 while 条件决定是否还有下一迭代
+        if (state.hook != null) state.hook.afterIteration(context);
+        return true;
+    }
+
+    /**
+     * while 体的终答分支（无工具调用；含 inj5/inj2 两个注入检查点）。返回
+     * shouldContinue：true = 注入到达、回到循环条件继续迭代；false = 终答落定、
+     * break 出循环。
+     */
+    private boolean handleFinalResponseBranch(
+            LLMResponse response, LoopState state, AgentRunSpec spec, AgentHookContext context) {
+
+        // No tool calls, this is the final response
+        state.finalContent = response.getContent();
+
+        // Injection check 5: empty response
+        if (state.finalContent == null || state.finalContent.isEmpty()) {
+            if (checkpoint(state, spec)) {
+                if (state.hook != null) state.hook.afterIteration(context);
+                return true;
+            }
+            // No injections and empty → append placeholder and break
+        }
+
+        // Append assistant message before checking for injections,
+        // so role alternation is preserved: assistant → user(injected).
+        state.currentMessages = contextBuilder.addAssistantMessage(
+            state.currentMessages, state.finalContent, null, response.getReasoningContent());
+
+        // Injection check 2: after final response
+        if (checkpoint(state, spec)) {
+            // 先广播中间答、再清 finalContent——只有本检查点的 continue 路径清除
+            // （inj4 的错误串就保留，由下一迭代的回复覆盖）
+            if (state.hook != null) {
+                state.hook.onIntermediateResponse(state.finalContent, context);
+            }
+            state.finalContent = null;
+            if (state.hook != null) state.hook.afterIteration(context);
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * 注入检查点仪式（inj1–inj5 五处同构块的去重，design D4）：抽干注入队列并把结果并回
+     * {@code state}（injectionCycles/hadInjections），返回是否应继续下一迭代。
+     *
+     * <p>只收敛同构部分——各调用侧 continue 路径的 hook 差异（inj1/4/5 带
+     * afterIteration、inj2 另有 onIntermediateResponse + finalContent 清空、inj3 无）保留
+     * 在调用侧。第 6 处（maxIterations 后收尾抽干 drain6）不走这里：它绕过
+     * MAX_INJECTION_CYCLES 上限、直接 append、永不 continue（见 runAgentLoop 尾部）。
+     */
+    private boolean checkpoint(LoopState state, AgentRunSpec spec) {
+        InjectionResult inj = tryDrainInjections(state.currentMessages, spec, state.injectionCycles);
+        state.injectionCycles = inj.injectionCycle;
+        state.hadInjections |= inj.hadInjections;
+        return inj.shouldContinue;
     }
 
     /**
@@ -605,7 +649,7 @@ public class AgentRunner {
      * ({@code _partition_tool_batches}): consecutive {@link Tool#isConcurrencySafe()}
      * calls form one parallel batch (via {@code executeAsyncWithEvents}, per-tool
      * timeout, results restored to call order); every unsafe call is its own
-     * singleton batch executed inline on this run carrier thread — ThreadLocal run
+     * singleton batch executed inline on the run thread — ThreadLocal run
      * context ({@code AgentRunContext}/{@code DelegationGuard}) stays visible
      * exactly as in the all-serial era. Batches run in call order; results and
      * events are returned in original call order. {@code failOnToolError} keeps
@@ -737,26 +781,5 @@ public class AgentRunner {
     private boolean isAborted(AgentRunSpec spec) {
         return (spec.getAbortFlag() != null && spec.getAbortFlag().get())
                 || Thread.currentThread().isInterrupted();
-    }
-
-    /**
-     * Abort-flag-only check, safe to evaluate on pooled carrier threads other than the
-     * run's own thread. Pre-loop/post-run consolidation runs on a ForkJoinPool carrier
-     * that {@link AgentRunner#interrupt()} never targets, so the thread-interrupt half
-     * of {@link #isAborted} would be meaningless there — only the shared flag reaches it.
-     */
-    private boolean isAbortedFlag(AgentRunSpec spec) {
-        return spec.getAbortFlag() != null && spec.getAbortFlag().get();
-    }
-
-    /**
-     * Interrupt the thread running the agent loop, called by Stop button.
-     */
-    public void interrupt() {
-        Thread t = runningThread;
-        if (t != null && t.isAlive()) {
-            log.info("Interrupting agent loop thread: {}", t.getName());
-            t.interrupt();
-        }
     }
 }

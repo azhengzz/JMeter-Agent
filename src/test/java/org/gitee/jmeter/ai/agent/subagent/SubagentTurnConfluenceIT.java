@@ -13,11 +13,14 @@ import org.gitee.jmeter.ai.agent.model.Message;
 import org.gitee.jmeter.ai.agent.model.ToolCall;
 import org.gitee.jmeter.ai.agent.model.ToolDefinition;
 import org.gitee.jmeter.ai.agent.session.SessionManager;
+import org.gitee.jmeter.ai.agent.testsupport.GatedScriptAiService;
+import org.gitee.jmeter.ai.agent.testsupport.NoopTool;
 import org.gitee.jmeter.ai.agent.tools.ToolRegistry;
 import org.gitee.jmeter.ai.agent.tools.subagent.SpawnTool;
 import org.gitee.jmeter.ai.service.AiService;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -217,6 +220,50 @@ class SubagentTurnConfluenceIT {
             assertNotNull(status, "the late subagent should still reach a terminal state");
             assertTrue(status.getResult() != null || status.getError() != null,
                 "a late result must remain retrievable via subagent_status, not be discarded");
+        }
+    }
+
+    /**
+     * drain 超时闩锁（{@code Turn.markDrainTimedOut}）：首个空检查点阻塞等待超时后，
+     * 本回合后续检查点不得再次阻塞等待——否则每个检查点都等满超时，回合时长随迭代数
+     * 线性膨胀。mock 的 SubagentManager 恒报 1 个可等待子代理（实际无人回灌结果），
+     * 4 个工具迭代 = 4 个空检查点：闩锁生效 ≈ 1×3s；闩锁失效 ≥ 4×3s=12s。
+     */
+    @Test
+    void drainTimeoutLatches_subsequentCheckpointsDoNotBlockAgain() throws Exception {
+        Path workspace = Files.createTempDirectory("drain-latch");
+        MemoryStore memoryStore = Mockito.mock(MemoryStore.class);
+        Mockito.when(memoryStore.getMemoryContext()).thenReturn("");
+        ToolRegistry registry = new ToolRegistry();
+        registry.register(new NoopTool());
+        GatedScriptAiService ai = new GatedScriptAiService();
+
+        AgentLoop latchLoop = new AgentLoop(registry, memoryStore,
+            Mockito.mock(MemoryConsolidator.class),
+            new ContextBuilder(memoryStore, workspace),
+            new SessionManager(workspace, "chat:latch"), ai);
+        SubagentManager manager = Mockito.mock(SubagentManager.class);
+        Mockito.when(manager.getWaitableCountBySession("chat:latch")).thenReturn(1);
+        latchLoop.setSubagentManager(manager);
+        try {
+            for (int i = 0; i < 4; i++) {
+                ai.script(LLMResponse.withToolCalls(
+                    List.of(new ToolCall("c" + i, "noop_tool", Map.of())), "s" + i));
+            }
+            ai.script(LLMResponse.text("LATCH-FINAL"));
+
+            long start = System.currentTimeMillis();
+            AgentResponse response = latchLoop.processMessage("m", "chat:latch")
+                .get(60, TimeUnit.SECONDS);
+            long elapsed = System.currentTimeMillis() - start;
+
+            assertTrue(response.isSuccess(), "turn should succeed: " + response.getErrorMessage());
+            assertEquals("LATCH-FINAL", response.getContent());
+            assertTrue(elapsed < 7_000,
+                "drain timeout must latch after the first blocking wait; "
+                    + "4 checkpoints × 3s would take ≥12s, took " + elapsed + "ms");
+        } finally {
+            latchLoop.shutdown();
         }
     }
 }

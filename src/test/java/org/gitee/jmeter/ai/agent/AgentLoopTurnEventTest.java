@@ -880,8 +880,8 @@ class AgentLoopTurnEventTest {
      * 攻击场景（缺陷）：L1 为换血前单例，其上挂着长回合 T1（HANG_UNTIL_RELEASED 钉在 LLM 调用里，
      * 用户视角 = 数分钟的 run_test）；模型切换把 L1 退役进 retiredLoops（shutdown 不打断在跑任务）；
      * 用户点 "+"（resetConversation 是 /new 与 "+" 共用的唯一实现，/new 命令路由见下一测试）——
-     * resetConversation 在 L2 内执行 signalCancel(RESET)（AgentLoop.java:1074），只查 L2 自己的
-     * abortFlags/activeTasks/injectionManager；T1 活在 L1 的同名 map 里，完全未被触碰；放行后 T1
+     * resetConversation 在 L2 内执行 signalCancel(RESET)（AgentLoop.java:1060），只查 L2 自己的
+     * activeTurnTokens（TurnRegistry 单表）；T1 活在 L1 的同名注册表里，完全未被触碰；放行后 T1
      * 收尾落盘（AgentRunner.saveMessagesToSession 的 abort 复查读 L1 的 flag=false），经 L1 自己的
      * SessionManager 缓存（invalidate 只清了 L2 缓存）全量重写刚被截断的 jsonl，旧对话复活。
      *
@@ -892,7 +892,7 @@ class AgentLoopTurnEventTest {
      * 2) spec.md「终态恰好一次」——T1 的终态在取消路径与回合体收尾路径竞态下恰好一条。
      * 3) spec.md「可插拔订阅与工厂级存活 → Scenario: 模型切换后订阅存活」——旧 loop 在跑回合的
      *    迟到终态仍可达订阅者（按回合身份过滤，本测试以 t1Id 过滤）。
-     * 4) resetConversation javadoc（AgentLoop.java:1046-1051）"中止在跑回合（含子代理）" +
+     * 4) resetConversation javadoc（AgentLoop.java:1026）"中止在跑回合（含子代理）" +
      *    AgentRunner.java:727-734 落盘守卫注释"不覆盖重置线程刚写的空文件"——会话被重置后，
      *    在跑回合必须被置 abort 并放弃落盘。interrupted 与"文件仍截断"两条断言联合钉住
      *    "L1 的 abort flag 为 true"：落盘守卫读的正是该 flag（flag 在 whenComplete 后即从 map

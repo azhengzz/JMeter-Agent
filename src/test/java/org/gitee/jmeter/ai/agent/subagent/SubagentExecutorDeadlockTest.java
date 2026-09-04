@@ -21,10 +21,13 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * Guards the subagent executor topology against thread-pool starvation.
  *
- * <p>A subagent task occupies a thread of the bounded subagent pool. If that task
- * also asks {@link AgentRunner} to run ON that same pool and then blocks waiting
- * for the result, the pool self-deadlocks — with the default pool size of 1 it
- * deadlocks every single time.
+ * <p>{@link AgentRunner#run} is synchronous and executes inline on the calling
+ * thread, so a subagent task occupies one thread of the bounded subagent pool
+ * and runs its whole agent loop on that same thread — there is no nested
+ * scheduling that could back onto the caller's pool. This test locks that
+ * contract: if {@code run} ever again schedules work onto an executor, a
+ * size-1 pool whose only thread is already occupied by the caller
+ * self-deadlocks.
  */
 class SubagentExecutorDeadlockTest {
 
@@ -45,9 +48,10 @@ class SubagentExecutorDeadlockTest {
      * A run started from a thread of a size-1 pool must still complete.
      *
      * <p>This is exactly the shape of {@code SubagentManager.runSubagent}: the
-     * caller already occupies the only subagent thread and joins on the run. It
-     * only stays deadlock-free because {@link AgentRunner} schedules onto the
-     * common pool rather than back onto the caller's pool.
+     * caller already occupies the only subagent thread. With synchronous
+     * {@code run} this is trivially deadlock-free (the loop runs inline on the
+     * caller's own thread); the 10s timeout guards the regression where run
+     * starts scheduling onto an executor again.
      */
     @Test
     void agentRunStartedFromASingleThreadPoolCompletes() throws Exception {
@@ -60,7 +64,10 @@ class SubagentExecutorDeadlockTest {
             AgentRunner runner = new AgentRunner(
                 new org.gitee.jmeter.ai.agent.tools.ToolRegistry(),
                 null,
-                null,
+                // 真实 ContextBuilder：终答分支会调 addAssistantMessage，传 null 会让
+                // run() 以 caught-NPE 收场——测试虽仍绿（断言只验完成不验成功），但
+                // 「正常完成」被架空成错误路径 + 全量门禁日志噪音（2026-09-03 验证轮发现）
+                SubagentTestSupport.contextBuilder(),
                 null,
                 new InstantAiService(),
                 3, 16000, 30000);
@@ -76,7 +83,7 @@ class SubagentExecutorDeadlockTest {
                         .persistSession(false)
                         .maxIterations(2)
                         .build();
-                    result.set(runner.run(spec).join());
+                    result.set(runner.run(spec));
                 } catch (Throwable t) {
                     failure.set(t);
                 }

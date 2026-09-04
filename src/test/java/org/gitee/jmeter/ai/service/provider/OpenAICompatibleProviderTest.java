@@ -164,8 +164,8 @@ class OpenAICompatibleProviderTest {
                 Arguments.of("none", null),
                 Arguments.of("null", null),
                 Arguments.of(null, null),
-                Arguments.of("garbage", ReasoningEffort.MEDIUM),
-                Arguments.of("", ReasoningEffort.MEDIUM)
+                Arguments.of("garbage", ReasoningEffort.HIGH),
+                Arguments.of("", ReasoningEffort.HIGH)
         );
     }
 
