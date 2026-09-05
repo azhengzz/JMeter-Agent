@@ -217,9 +217,12 @@ public class OpenAICompatibleProvider implements AiService {
             boolean alwaysOn = spec != null && spec.isThinkingAlwaysOn(modelName);
 
             // Apply reasoning effort via the SDK enum (includes MAX). Skip for models without
-            // thinking support. Values a model doesn't accept (e.g. K3 with minimal/medium/xhigh)
-            // pass through unchanged — the provider rejects them, surfacing the misconfiguration
-            // rather than silently clamping it.
+            // thinking support. Values a model doesn't accept (e.g. K3/GLM-5.3 with
+            // minimal/medium/xhigh) pass through unchanged — the provider rejects them,
+            // surfacing the misconfiguration rather than silently clamping it. Always-on
+            // models only force thinking.type=enabled below; a configured "none" simply omits
+            // reasoning_effort and lands on the server default (deepest, e.g. GLM-5.3 max) —
+            // the README documents "none" as unsupported for these models.
             ReasoningEffort effort = toReasoningEffort(effectiveReasoningEffort);
             if (effort != null && modelSupportsThinking) {
                 paramsBuilder.reasoningEffort(effort);

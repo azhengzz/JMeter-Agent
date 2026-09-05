@@ -34,6 +34,12 @@ public class ProviderRegistry {
 
         // Zhipu AI (GLM): GLM-4.5+ 支持 thinking.type=enabled/disabled。
         // GLM-4.5/4.6 为混合推理（动态决定），GLM-4.7/5/5.1 默认开启思考。
+        // GLM-5.3/5.3-flash 强制思考：thinking.type 仅支持 enabled（传 disabled 直接报错），
+        //   思考程度改由顶层 reasoning_effort（low/high/max，默认 max）控制。沿 Kimi K3 先例
+        //   注册 thinkingAlwaysOnModels（仅强制 thinking.type=enabled；reasoning.effort=none 时
+        //   省略 reasoning_effort，服务端按默认 max 深度思考——这些模型不支持 none，误配不报错
+        //   但也不省 token，README 已提示用户直接配 low/high/max）。
+        //   https://docs.bigmodel.cn/cn/guide/start/migrate-to-glm-new
         // 偏离 Nanobot：通过 reasoning_effort 显式控制（none→disabled，medium/high→enabled）。
         PROVIDERS.add(new ProviderSpec.Builder()
                 .name("zhipu")
@@ -46,6 +52,7 @@ public class ProviderRegistry {
                 //         "glm-4.5", "glm-4.5-air", "glm-4.5-flash",
                 //         "glm-4.6", "glm-4.7",
                 //         "glm-5", "glm-5.1")
+                .thinkingAlwaysOnModels("glm-5.3", "glm-5.3-flash")
                 .build());
 
         // Moonshot (Kimi). base_url follows the official Kimi K3 quickstart (api.moonshot.cn/v1).

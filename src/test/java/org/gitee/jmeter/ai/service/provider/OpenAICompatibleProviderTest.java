@@ -220,6 +220,61 @@ class OpenAICompatibleProviderTest {
         assertEquals("thinking_type", moonshot.getThinkingStyle());
     }
 
+    // ==================== GLM-5.3 spec wiring ====================
+
+    @Test
+    void testGlm53_IsThinkingAlwaysOn() {
+        // GLM-5.3 / GLM-5.3-flash: thinking.type only supports "enabled" (disabled → API error).
+        ProviderSpec zhipu = ProviderRegistry.findByName("zhipu");
+        assertNotNull(zhipu);
+        assertTrue(zhipu.isThinkingAlwaysOn("glm-5.3"), "GLM-5.3 thinking is always on");
+        assertTrue(zhipu.isThinkingAlwaysOn("glm-5.3-flash"), "GLM-5.3-Flash thinking is always on");
+        assertTrue(zhipu.isThinkingAlwaysOn("GLM-5.3-FLASH"), "always-on check is case-insensitive");
+    }
+
+    @Test
+    void testGlm53_OlderModels_NotAlwaysOn() {
+        // Older GLM models still accept thinking.type=disabled — must stay disableable.
+        ProviderSpec zhipu = ProviderRegistry.findByName("zhipu");
+        assertNotNull(zhipu);
+        assertFalse(zhipu.isThinkingAlwaysOn("glm-4.5"));
+        assertFalse(zhipu.isThinkingAlwaysOn("glm-4.6"));
+        assertFalse(zhipu.isThinkingAlwaysOn("glm-4.7"));
+        assertFalse(zhipu.isThinkingAlwaysOn("glm-5"));
+        assertFalse(zhipu.isThinkingAlwaysOn("glm-5.1"));
+        assertFalse(zhipu.isThinkingAlwaysOn(null));
+    }
+
+    @Test
+    void testGlm53_SupportsThinking() {
+        // zhipu leaves thinkingModels empty => every model supports the thinking toggle.
+        ProviderSpec zhipu = ProviderRegistry.findByName("zhipu");
+        assertNotNull(zhipu);
+        assertTrue(zhipu.supportsThinking("glm-5.3"));
+        assertTrue(zhipu.supportsThinking("glm-5.3-flash"));
+    }
+
+    @Test
+    void testGlm53_UsesThinkingTypeStyle() {
+        // GLM-5.3 keeps the provider-wide thinking_type style; the always-on flag forces
+        // its "enabled" branch and never lets "disabled" reach the API.
+        ProviderSpec zhipu = ProviderRegistry.findByName("zhipu");
+        assertNotNull(zhipu);
+        assertEquals("thinking_type", zhipu.getThinkingStyle());
+    }
+
+    @Test
+    void testGlm53_DetectedByModelAndPrefixedId() {
+        // glm-5.3 routes to zhipu via the "glm" keyword (no per-model registration needed).
+        ProviderSpec byModel = ProviderRegistry.findByModel("glm-5.3");
+        assertNotNull(byModel, "keyword 'glm' must match glm-5.3");
+        assertEquals("zhipu", byModel.getName());
+
+        ProviderSpec byPrefixedId = ProviderRegistry.detectProvider("zhipu:glm-5.3-flash");
+        assertNotNull(byPrefixedId);
+        assertEquals("zhipu", byPrefixedId.getName());
+    }
+
     // ==================== isToolChoiceUnsupported(Throwable) ====================
 
     @ParameterizedTest

@@ -26,7 +26,8 @@ public final class ProviderSpec {
     //                      关 → {"thinking":{"type":"disabled"}}
     private final String thinkingStyle;
 
-    // Models whose thinking mode cannot be disabled (e.g. Moonshot kimi-k2.7-code, kimi-k3).
+    // Models whose thinking mode cannot be disabled (e.g. Moonshot kimi-k2.7-code, kimi-k3,
+    // Zhipu glm-5.3/glm-5.3-flash).
     // Sending a disabled thinking.type for these models causes API rejection;
     // force enabled regardless of reasoning_effort.
     private final Set<String> thinkingAlwaysOnModels;
