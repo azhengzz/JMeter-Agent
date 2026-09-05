@@ -200,9 +200,9 @@ public class AiConfig {
         return getDouble("jmeter.ai.temperature", 0.7);
     }
 
-    /** 推理强度(reasoning effort)。默认 medium。 */
+    /** 推理强度(reasoning effort)。默认 high。 */
     public static String getReasoningEffort() {
-        return getProperty("jmeter.ai.reasoning.effort", "medium");
+        return getProperty("jmeter.ai.reasoning.effort", "high");
     }
 
     /** 自定义系统提示词。默认空串。 */

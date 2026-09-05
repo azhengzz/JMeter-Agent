@@ -9,8 +9,8 @@ Gitee Ai 是一个 JMeter AI Agent 插件，通过 Agent Loop 架构驱动 LLM �
 ## 核心特性
 
 - **Agent Loop 架构** — LLM 调用 → 工具执行 → 结果反馈的完整迭代循环，支持多轮工具调用完成复杂任务
-- **22 Agent 工具** — 覆盖 JMeter 元素 CRUD、测试执行、文件系统、Web 搜索、命令执行等场景
-- **技能系统** — 从文件系统动态加载技能模块，内置 JMeter 专业知识（73 组件参考文档、58 个函数参考）、API 自动化测试等
+- **30 个内置 Agent 工具** — 覆盖 JMeter 元素增删改查（含批量操作与启用/禁用）、JMX 解析、测试执行、跨实例协作、文件系统、Web 搜索/抓取、命令执行等场景
+- **技能系统** — 从文件系统动态加载技能模块，内置 JMeter 专业知识（73 组件参考文档、58 个函数参考）
 - **8 个 AI 提供者** — 支持 Anthropic Claude、OpenAI、DeepSeek、智谱 GLM、Moonshot Kimi、MiniMax、LangCat、Ollama
 - **组件 Schema 校验** — 73 个 YAML Schema 文件，为 JMeter 组件参数提供类型、必填、枚举、范围等校验
 - **记忆系统** — 双层记忆架构（长期记忆 + 事件历史），支持跨会话记忆整合
@@ -60,38 +60,47 @@ AgentLoop（主循环）
 
 1. **配置 API Key** — 在 `user.properties` 中设置你的 AI 提供者密钥，例如：
    ```properties
-   # 使用 MiniMax（默认提供者）
-   minimax.api.key=your-api-key
+   # 默认提供者为 deepseek，配置其 API Key 即可直接使用
+   deepseek.api.key=your-api-key
 
-   # 或使用 Anthropic Claude
+   # 使用其他提供者时需同时指定 jmeter.ai.default.provider，例如 Anthropic Claude：
    anthropic.api.key=your-api-key
    jmeter.ai.default.provider=anthropic
    ```
-2. **打开聊天面板** — 右键 `Add > Non-Test Elements > Gitee Ai`
+2. **打开聊天面板** — 点击菜单栏 **AI** 菜单或工具栏 AI 按钮（快捷键 `Alt+V`）
 3. **开始对话** — 直接描述你的需求，例如"创建一个包含 10 个线程的线程组，发送 GET 请求到 http://example.com"
 
 ## Agent 工具
 
-### JMeter 元素工具（默认启用）
+除子代理工具（默认关闭）外，以下工具在默认配置下均注册启用；各分组可分别通过配置开关关闭（见[工具配置](#工具配置)）。
+
+### JMeter 元素工具
 
 | 工具名 | 说明 |
 |--------|------|
 | `create_jmeter_element` | 创建 JMeter 元素（线程组、采样器、控制器、断言、定时器等） |
 | `update_jmeter_element` | 更新已有元素的属性 |
+| `batch_update_jmeter_elements` | 批量更新同类型多个元素的属性（一次校验、一次刷新 GUI） |
 | `delete_jmeter_element` | 删除指定元素（不可删除 TestPlan 根节点） |
-| `move_jmeter_element` | 移动元素到不同父节点，支持精确位置控制 |
+| `batch_delete_jmeter_elements` | 批量删除多个元素（删除前统一校验） |
+| `move_jmeter_element` | 移动元素到不同父节点，支持精确位置控制（first / last / before:<id> / after:<id>） |
+| `batch_move_jmeter_elements` | 批量移动多个元素到同一父节点的同一位置 |
+| `copy_paste_jmeter_element` | 复制粘贴测试计划元素 |
+| `toggle_jmeter_element` | 启用、禁用或切换元素状态（禁用的元素在测试执行中被跳过） |
+| `batch_toggle_jmeter_elements` | 批量启用、禁用或切换多个元素状态 |
 | `get_test_plan_tree` | 获取完整测试计划树结构（JSON） |
 | `get_selected_element` | 获取当前选中元素的详细信息 |
 | `find_element` | 按名称、类型或路径查找元素 |
-| `copy_paste_jmeter_element` | 复制粘贴测试计划元素 |
+| `query_element_properties` | 按属性名/属性值查询测试计划中的元素 |
 
-### AI 增强工具
+### JMX 与脚本工具
 
 | 工具名 | 说明 |
 |--------|------|
-| `optimize_jmeter_element` | AI 分析并优化选中元素的配置 |
-| `lint_jmeter_elements` | AI 重命名元素以改善可读性和组织性 |
-| `get_usage` | 查看 Token 使用统计 |
+| `parse_jmx_file` | 解析外部 JMX 脚本文件（返回组件树，或按条件过滤查询元素） |
+| `open_jmx_file` | 在当前 GUI 中打开外部 JMX 文件（默认替换当前计划，可合并加载） |
+| `get_script_info` | 获取当前脚本与运行环境信息（脚本路径、保存状态、JMeter/JDK 版本、JMETER_HOME） |
+| `get_log_panel_content` | 按行范围读取 JMeter LoggerPanel 日志面板内容 |
 
 ### 测试执行工具
 
@@ -101,13 +110,14 @@ AgentLoop（主循环）
 | `get_test_status` | 获取测试执行状态（运行状态、线程进度、采样数） |
 | `get_test_results` | 获取测试结果（响应时间、吞吐量、错误率） |
 
-### 实用工具
+### 跨实例协作工具（随 IPC 注册，默认开启）
 
 | 工具名 | 说明 |
 |--------|------|
-| `wrap_http_samplers` | 将连续 HTTP 采样器包装到事务控制器下 |
+| `list_instances` | 列出本机所有存活的 JMeter AI 实例（含自身）及其打开的测试计划 |
+| `delegate_to_instance` | 将任务委派给本机另一个 JMeter AI 实例执行，并阻塞等待其结果 |
 
-### 文件系统工具（需启用）
+### 文件系统工具（默认启用）
 
 | 工具名 | 说明 |
 |--------|------|
@@ -116,18 +126,27 @@ AgentLoop（主循环）
 | `edit_file` | 编辑文件（字符串替换） |
 | `list_dir` | 列出目录内容，支持递归 |
 
-### Web 工具（需启用）
+### Web 工具（默认启用）
 
 | 工具名 | 说明 |
 |--------|------|
 | `web_search` | 搜索互联网（支持 Brave、Tavily、Jina 等搜索引擎） |
-| `web_fetch` | 抓取网页内容，自动去除导航和广告 |
+| `web_fetch` | 抓取网页内容（优先经 Jina Reader 提取正文，直连时转为 Markdown/纯文本） |
 
-### 命令执行工具（需启用）
+### 命令执行工具（默认启用）
 
 | 工具名 | 说明 |
 |--------|------|
 | `exec` | 执行 Shell 命令，支持超时和工作目录配置 |
+
+### 子代理工具（默认关闭）
+
+设置 `agent.subagent.enabled=true` 后注册（配置见下文「异步子代理（Subagent）」）。
+
+| 工具名 | 说明 |
+|--------|------|
+| `spawn` | 将自包含的只读分析任务委派给后台子代理 |
+| `subagent_status` | 查询子代理的进度与结果 |
 
 ## 命令
 
@@ -150,12 +169,13 @@ AgentLoop（主循环）
 # 常用命令(全局选项:--pid --token --json --jmeter-home --timeout)
 jmeter-cli list                                                 # 发现实例
 jmeter-cli health                                               # 探活
-jmeter-cli find --searchBy elementType --query testplan         # 查 TestPlan 根
+jmeter-cli tool get_test_plan_tree                              # 查 TestPlan 根 id
+jmeter-cli find --searchBy name --query "HTTP"                  # 按名称模糊查找元素
 jmeter-cli create --elementType threadgroup --elementName TG1 --parentId <id>
 jmeter-cli agent "再加一个 5 用户的线程组"
 ```
 
-完整命令清单、87 条测试用例与一键回归脚本见 [docs/jmeter-cli-test-cases.md](docs/jmeter-cli-test-cases.md)；实现方案见 [TODO/cli-support-plan.md](TODO/cli-support-plan.md)。
+完整命令清单、87 条测试用例与一键回归脚本见 [docs/test/jmeter-cli-test-cases.md](docs/test/jmeter-cli-test-cases.md)；实现方案见 [TODO/cli-support-plan.md](TODO/cli-support-plan.md)。
 
 `skills/jmeter-cli/` 是面向**第三方 Agent**（如 OpenClaw、Hermes、Codex 等外部自动化工具）使用的 skill 文档，指导它们通过 `jmeter-cli` 命令操作运行中的 JMeter GUI 实例。它不在插件内加载，而是由外部 Agent 的 skill 系统读取。
 
@@ -216,12 +236,12 @@ Agent 通过文件系统动态加载技能模块，每个技能包含 `SKILL.md`
 | `jmeter.ai.temperature` | 温度参数（0.0-1.0），越低越确定性 | `0.7` |
 | `jmeter.ai.max.tokens` | 单次响应最大 Token 数 | `4096` |
 | `jmeter.ai.max.history.size` | 对话历史保留条数 | `120` |
-| `jmeter.ai.reasoning.effort` | 推理强度：none / low / medium / high / xhigh / max | `medium` |
+| `jmeter.ai.reasoning.effort` | 推理强度：none / minimal / low / medium / high / xhigh / max | `high` |
 | `jmeter.ai.default.model` | 默认模型（所有提供者共用，除非运行时切换） | `deepseek-v4-flash` |
 | `jmeter.ai.default.provider` | 默认提供者（anthropic / openai / ollama / deepseek / zhipu / moonshot / minimax / langcat） | `deepseek` |
 | `jmeter.ai.context.window.tokens` | 上下文窗口大小（供 ContextWindowManager、MemoryConsolidator、AgentRunner 使用） | `65536` |
 | `jmeter.ai.max.tool.iterations` | 单次 Agent 循环最大工具迭代数 | `50` |
-| `jmeter.ai.system.prompt` | 统一系统提示（覆盖内置默认提示，适用于所有提供者） | 空（使用内置提示） |
+| `jmeter.ai.system.prompt` | 统一系统提示（注意：当前版本 Agent 主循环固定使用内置提示组装上下文，此配置仅对未注入系统消息的服务层兜底路径生效） | 空（使用内置提示） |
 
 ### 各模型推荐配置
 
@@ -231,8 +251,9 @@ Agent 通过文件系统动态加载技能模块，每个技能包含 `SKILL.md`
 |--------|---------|-------------|------------|-----------------|----------------------|
 | deepseek | deepseek-v4-flash | `0.7` | `65536` | `[none, low, high, max]` | `512000` |
 | deepseek | deepseek-v4-pro | `0.7` | `65536` | `[none, low, high, max]` | `512000` |
-| zhipu | glm-5.1 | `1.0` | `65536` | `[none, medium]` | `128000` |
 | zhipu | glm-5.2 | `1.0` | `65536` | `[none, minimal, low, medium, high, xhigh, max]` | `512000` |
+| zhipu | glm-5.3 | `1.0` | `65536` | `[low, high, max]` | `512000` |
+| zhipu | glm-5.3-flash | `1.0` | `65536` | `[low, high, max]` | `512000` |
 | moonshot | kimi-k2.6 | `1.0`（API 强制） | `8192` | `medium` | `128000` |
 | moonshot | kimi-k2.7-code | `1.0`（API 强制） | `8192` | `medium` | `128000` |
 | moonshot | kimi-k3 | `1.0`（API 强制） | `65536` | `[low, high, max]` [其他值默认按"max"处理](https://platform.kimi.com/docs/guide/use-thinking-effort) | `512000` |
@@ -296,6 +317,9 @@ Agent 通过文件系统动态加载技能模块，每个技能包含 `SKILL.md`
 | `agent.tool.result.max.chars` | 工具结果截断长度（字符） | `16000` |
 | `jmeter.ai.injection.queue.size` | 单个会话最大排队注入消息数 | `20` |
 | `jmeter.ai.injection.max.per.turn` | 每个 Agent 回合处理的注入消息上限 | `3` |
+| `agent.runcapture.enabled` | 捕获 GUI 手动启动的测试运行（自动注入结果收集器，供 `get_test_status`/`get_test_results` 读取；关闭后仅 `run_test` 发起的运行被捕获） | `true` |
+| `agent.session.per-instance` | 每个 JMeter 实例使用独立会话文件（`false` 回退到全局共享会话） | `true` |
+| `agent.session.reap.ttl.days` | 孤儿会话文件回收 TTL（天；仅当归属实例已确认死亡且超过该时限才删除） | `7` |
 | `agent.workspace.path` | 工作空间路径（保存 MEMORY.md、HISTORY.md、会话、技能、模板） | 三档回退：`agent.workspace.path` → `{jmeter.home}/bin/jmeter-agent`（默认）→ `{user.home}/.jmeter-ai/agent`（JMeter home 不可用时） |
 
 ### 记忆配置
@@ -303,6 +327,7 @@ Agent 通过文件系统动态加载技能模块，每个技能包含 `SKILL.md`
 | 属性 | 说明 | 默认值 |
 |------|------|--------|
 | `agent.memory.enabled` | 启用记忆系统 | `true` |
+| `agent.memory.consolidate-on-exit.timeout.ms` | 关闭时深度蒸馏的超时（毫秒；超时则保留已归档的 HISTORY.md 并直接退出。关闭时归档到 HISTORY.md 始终执行，不可配置） | `120000` |
 
 ### 工具配置
 
@@ -337,6 +362,7 @@ Agent 通过文件系统动态加载技能模块，每个技能包含 `SKILL.md`
 | `agent.tools.websearch.max.results` | 最大搜索结果数 | `10` |
 | `agent.tools.websearch.timeout` | 搜索超时（秒） | `30` |
 | `agent.tools.websearch.tavily.api.key` | Tavily API 密钥（provider=tavily 时必填） | — |
+| `agent.tools.websearch.brave.api.key` | Brave API 密钥（provider=brave 时使用，未配置时回落 Jina） | — |
 | `agent.tools.websearch.jina.api.key` | Jina API 密钥（provider=jina 时必填） | — |
 | `agent.tools.webfetch.timeout` | 网页抓取超时（秒） | `30` |
 | `agent.tools.web.max.redirects` | 最大重定向次数 | `5` |

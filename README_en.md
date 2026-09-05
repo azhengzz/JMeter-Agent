@@ -9,8 +9,8 @@ Gitee Ai is a JMeter AI Agent plugin powered by an Agent Loop architecture that 
 ## Key Features
 
 - **Agent Loop Architecture** — Full iterative cycle of LLM call → tool execution → result feedback, supporting multi-turn tool calling for complex tasks
-- **22 Agent Tools** — Covering JMeter element CRUD, test execution, filesystem, web search, and command execution
-- **Skills System** — Dynamically loaded skill modules from filesystem, with built-in JMeter expertise (73 component references, 58 function references), API autotest, and more
+- **30 Built-in Agent Tools** — Covering JMeter element CRUD (incl. batch operations and enable/disable), JMX parsing, test execution, cross-instance coordination, filesystem, web search/fetch, and command execution
+- **Skills System** — Dynamically loaded skill modules from filesystem, with built-in JMeter expertise (73 component references, 58 function references)
 - **8 AI Providers** — Anthropic Claude, OpenAI, DeepSeek, Zhipu GLM, Moonshot Kimi, MiniMax, LangCat, Ollama
 - **Component Schema Validation** — 73 YAML schema files providing type, required, enum, and range validation for JMeter component parameters
 - **Memory System** — Two-layer memory architecture (long-term memory + event history) with cross-session consolidation
@@ -60,38 +60,47 @@ Response to Chat UI
 
 1. **Configure API Key** — Set your AI provider key in `user.properties`:
    ```properties
-   # Using MiniMax (default provider)
-   minimax.api.key=your-api-key
+   # The default provider is deepseek — just set its API key to get started
+   deepseek.api.key=your-api-key
 
-   # Or using Anthropic Claude
+   # For other providers, also set jmeter.ai.default.provider, e.g. Anthropic Claude:
    anthropic.api.key=your-api-key
    jmeter.ai.default.provider=anthropic
    ```
-2. **Open Chat Panel** — Right-click `Add > Non-Test Elements > Gitee Ai`
+2. **Open Chat Panel** — Click the **AI** menu in the menu bar or the AI toolbar button (shortcut `Alt+V`)
 3. **Start Chatting** — Describe your needs directly, e.g., "Create a thread group with 10 threads sending GET requests to http://example.com"
 
 ## Agent Tools
 
-### JMeter Element Tools (Enabled by Default)
+Except for the subagent tools (off by default), all tools below are registered and enabled under the default configuration; each group can be disabled separately via its configuration switch (see [Tool Configuration](#tool-configuration)).
+
+### JMeter Element Tools
 
 | Tool | Description |
 |------|-------------|
 | `create_jmeter_element` | Create JMeter elements (thread groups, samplers, controllers, assertions, timers, etc.) |
 | `update_jmeter_element` | Update properties of existing elements |
+| `batch_update_jmeter_elements` | Batch update properties of multiple elements of the same type (single validation, single GUI refresh) |
 | `delete_jmeter_element` | Delete a specific element (TestPlan root cannot be deleted) |
-| `move_jmeter_element` | Move element to a different parent node with precise positioning |
+| `batch_delete_jmeter_elements` | Delete multiple elements in one operation (all validated before any deletion) |
+| `move_jmeter_element` | Move element to a different parent node with precise positioning (first / last / before:<id> / after:<id>) |
+| `batch_move_jmeter_elements` | Batch move multiple elements to a shared parent node at a shared position |
+| `copy_paste_jmeter_element` | Copy and paste test plan elements |
+| `toggle_jmeter_element` | Enable, disable, or toggle an element (disabled elements are skipped during test execution) |
+| `batch_toggle_jmeter_elements` | Batch enable, disable, or toggle multiple elements |
 | `get_test_plan_tree` | Get complete test plan tree structure (JSON) |
 | `get_selected_element` | Get detailed info about the currently selected element |
 | `find_element` | Find elements by name, type, or path |
-| `copy_paste_jmeter_element` | Copy and paste test plan elements |
+| `query_element_properties` | Query test plan elements by property name/value |
 
-### AI-Enhanced Tools
+### JMX & Script Tools
 
 | Tool | Description |
 |------|-------------|
-| `optimize_jmeter_element` | AI analyzes and optimizes the selected element's configuration |
-| `lint_jmeter_elements` | AI renames elements for better readability and organization |
-| `get_usage` | View token usage statistics |
+| `parse_jmx_file` | Parse an external JMX script file (returns the component tree, or filtered element queries) |
+| `open_jmx_file` | Open an external JMX file in the current GUI (replaces the current plan by default; can merge) |
+| `get_script_info` | Get current script and runtime environment info (script path, save state, JMeter/JDK version, JMETER_HOME) |
+| `get_log_panel_content` | Read JMeter LoggerPanel (bottom log panel) content by line range |
 
 ### Test Execution Tools
 
@@ -101,13 +110,14 @@ Response to Chat UI
 | `get_test_status` | Get test execution status (running state, thread progress, sample counts) |
 | `get_test_results` | Get test results (response times, throughput, error rate) |
 
-### Utility Tools
+### Cross-Instance Coordination Tools (registered with IPC, on by default)
 
 | Tool | Description |
 |------|-------------|
-| `wrap_http_samplers` | Wrap consecutive HTTP samplers under Transaction Controllers |
+| `list_instances` | List all live JMeter AI instances on this machine (including self) and their open test plans |
+| `delegate_to_instance` | Delegate a task to another JMeter AI instance on this machine and block for its result |
 
-### Filesystem Tools (Must Enable)
+### Filesystem Tools (Enabled by Default)
 
 | Tool | Description |
 |------|-------------|
@@ -116,18 +126,27 @@ Response to Chat UI
 | `edit_file` | Edit files (string replacement) |
 | `list_dir` | List directory contents with recursive support |
 
-### Web Tools (Must Enable)
+### Web Tools (Enabled by Default)
 
 | Tool | Description |
 |------|-------------|
 | `web_search` | Search the web (supports Brave, Tavily, Jina, and more) |
-| `web_fetch` | Fetch web page content, auto-stripping navigation and ads |
+| `web_fetch` | Fetch web page content (prefers Jina Reader for main-content extraction; falls back to Markdown/plain text on direct fetch) |
 
-### Execution Tool (Must Enable)
+### Execution Tool (Enabled by Default)
 
 | Tool | Description |
 |------|-------------|
 | `exec` | Execute shell commands with timeout and working directory configuration |
+
+### Subagent Tools (Off by Default)
+
+Registered when `agent.subagent.enabled=true` (see the Async Subagent configuration below).
+
+| Tool | Description |
+|------|-------------|
+| `spawn` | Delegate a self-contained read-only analysis task to a background subagent |
+| `subagent_status` | Check the progress and results of spawned subagents |
 
 ## Commands
 
@@ -150,15 +169,16 @@ In addition to the chat panel, you can drive a running JMeter GUI instance via *
 # Common commands (global options: --pid --token --json --jmeter-home --timeout)
 jmeter-cli list                                                 # discover instances
 jmeter-cli health                                               # health check
+jmeter-cli tool get_test_plan_tree                              # get TestPlan root id
+jmeter-cli find --searchBy name --query "HTTP"                  # fuzzy-find elements by name
 jmeter-cli run --ignoreTimers true --wait                       # run test and wait for completion
 jmeter-cli status                                               # check test progress
 jmeter-cli results --format both --limit 10                     # view test results
-jmeter-cli find --searchBy elementType --query testplan         # find TestPlan root
 jmeter-cli create --elementType threadgroup --elementName TG1 --parentId <id>
 jmeter-cli agent "add a thread group with 5 users"
 ```
 
-See [docs/jmeter-cli-test-cases.md](docs/jmeter-cli-test-cases.md) for the full command reference and regression scripts.
+See [docs/test/jmeter-cli-test-cases.md](docs/test/jmeter-cli-test-cases.md) for the full command reference and regression scripts.
 
 `skills/jmeter-cli/` is a skill intended for **third-party agents** (such as OpenClaw, Hermes, Codex, and other external automation tools). It teaches them how to operate a running JMeter GUI through `jmeter-cli`. It is not loaded by the plugin — external agents read it through their own skill systems.
 
@@ -219,12 +239,12 @@ These settings apply to all AI providers unless overridden by provider-specific 
 | `jmeter.ai.temperature` | Temperature (0.0-1.0); lower = more deterministic | `0.7` |
 | `jmeter.ai.max.tokens` | Max tokens per response | `4096` |
 | `jmeter.ai.max.history.size` | Conversation history size to retain | `120` |
-| `jmeter.ai.reasoning.effort` | Reasoning effort: none / low / medium / high / xhigh / max | `medium` |
+| `jmeter.ai.reasoning.effort` | Reasoning effort: none / minimal / low / medium / high / xhigh / max | `high` |
 | `jmeter.ai.default.model` | Default model (shared by all providers unless switched at runtime) | `deepseek-v4-flash` |
 | `jmeter.ai.default.provider` | Default provider (anthropic / openai / ollama / deepseek / zhipu / moonshot / minimax / langcat) | `deepseek` |
 | `jmeter.ai.context.window.tokens` | Context window size (used by ContextWindowManager, MemoryConsolidator, AgentRunner) | `65536` |
 | `jmeter.ai.max.tool.iterations` | Max tool iterations per agent loop | `50` |
-| `jmeter.ai.system.prompt` | Unified system prompt (overrides built-in default, applies to all providers) | Empty (uses built-in prompt) |
+| `jmeter.ai.system.prompt` | Unified system prompt (note: in the current version the Agent main loop always assembles its context from the built-in prompt; this setting only takes effect on the service-layer fallback path where no system message is injected) | Empty (uses built-in prompt) |
 
 ### Per-Model Recommended Configuration
 
@@ -234,8 +254,9 @@ The table below lists recommended values for mainstream models.
 |----------|-------|-------------|------------|-----------------|----------------------|
 | deepseek | deepseek-v4-flash | `0.7` | `65536` | `[none, low, high, max]` | `512000` |
 | deepseek | deepseek-v4-pro | `0.7` | `65536` | `[none, low, high, max]` | `512000` |
-| zhipu | glm-5.1 | `1.0` | `65536` | `[none, medium]` | `128000` |
 | zhipu | glm-5.2 | `1.0` | `65536` | `[none, minimal, low, medium, high, xhigh, max]` | `512000` |
+| zhipu | glm-5.3 | `1.0` | `65536` | `[low, high, max]` | `512000` |
+| zhipu | glm-5.3-flash | `1.0` | `65536` | `[low, high, max]` | `512000` |
 | moonshot | kimi-k2.6 | `1.0` (API-enforced) | `8192` | `medium` | `128000` |
 | moonshot | kimi-k2.7-code | `1.0` (API-enforced) | `8192` | `medium` | `128000` |
 | moonshot | kimi-k3 | `1.0` (API-enforced) | `65536` | `[low, high, max]` [Other values are handled by default as "max".](https://platform.kimi.com/docs/guide/use-thinking-effort) | `512000` |
@@ -248,6 +269,7 @@ The table below lists recommended values for mainstream models.
 - **max.tokens** — The single-response output cap from each model's API; values above the cap are clipped server-side. For reasoning models (e.g., `deepseek-reasoner`), the visible output is reduced by the chain-of-thought tokens.
 - **reasoning.effort** — `none` disables thinking (faster and cheaper), suited for routine chat and simple tool calls; reasoning models should use `medium` or `high` to leverage deeper analysis.
 - **MiniMax thinking switch** — Controlled via `thinking.type` (`reasoning_effort=none` → `disabled`; otherwise M3 uses `adaptive`, M2.x uses `enabled`). The **M3** family can truly disable thinking; the **M2.x** family silently ignores `disabled`, so thinking cannot be turned off (known limitation, not a client-side defect).
+- **GLM-5.3 / GLM-5.3-flash forced thinking** — The API no longer accepts `thinking.type=disabled` (it errors out), and the [official migration guide](https://docs.bigmodel.cn/cn/guide/start/migrate-to-glm-new) states these models do not support `none`. The plugin registers them as always-on: `thinking.type` is always sent as `enabled`; configure `jmeter.ai.reasoning.effort` as `low/high/max` to control thinking depth and cost — with `none` the plugin omits `reasoning_effort`, so the server applies its deepest default (`max`; no error, but no token savings either); `minimal/medium/xhigh` are passed through as-is and arbitrated by the server (no silent clamping, same policy as Kimi K3).
 - **context.window.tokens** — Recommend ~80% of the model's context window ceiling, leaving headroom for tool results, memory consolidation, and the system prompt. Too large triggers frequent consolidation; too small discards history prematurely.
 
 ### Provider Configuration
@@ -299,6 +321,9 @@ Each provider also supports `*.temperature`, `*.max.history.size`, etc. to overr
 | `agent.tool.result.max.chars` | Tool result truncation length (chars) | `16000` |
 | `jmeter.ai.injection.queue.size` | Max queued injection messages per session | `20` |
 | `jmeter.ai.injection.max.per.turn` | Max injection messages processed per agent turn | `3` |
+| `agent.runcapture.enabled` | Capture GUI-initiated test runs (auto-injects a result collector so `get_test_status`/`get_test_results` see live data; when off, only runs started via `run_test` are captured) | `true` |
+| `agent.session.per-instance` | Each JMeter instance uses its own session file (`false` reverts to the legacy global shared session) | `true` |
+| `agent.session.reap.ttl.days` | Orphan session reap TTL (days; files are deleted only when the owning instance is confirmed dead and past this age) | `7` |
 | `agent.workspace.path` | Workspace path (stores MEMORY.md, HISTORY.md, sessions, skills, templates) | Three-tier fallback: `agent.workspace.path` → `{jmeter.home}/bin/jmeter-agent` (default) → `{user.home}/.jmeter-ai/agent` (when JMeter home is unavailable) |
 
 ### Memory Configuration
@@ -306,6 +331,7 @@ Each provider also supports `*.temperature`, `*.max.history.size`, etc. to overr
 | Property | Description | Default |
 |----------|-------------|---------|
 | `agent.memory.enabled` | Enable memory system | `true` |
+| `agent.memory.consolidate-on-exit.timeout.ms` | Bounded timeout (ms) for the close-time deep distillation (on timeout, the already-archived HISTORY.md is kept and JMeter exits; archiving to HISTORY.md on close always happens and is not configurable) | `120000` |
 
 ### Tool Configuration
 
@@ -340,6 +366,7 @@ Each provider also supports `*.temperature`, `*.max.history.size`, etc. to overr
 | `agent.tools.websearch.max.results` | Max search results | `10` |
 | `agent.tools.websearch.timeout` | Search timeout (seconds) | `30` |
 | `agent.tools.websearch.tavily.api.key` | Tavily API key (required when provider=tavily) | — |
+| `agent.tools.websearch.brave.api.key` | Brave API key (used when provider=brave; falls back to Jina when unset) | — |
 | `agent.tools.websearch.jina.api.key` | Jina API key (required when provider=jina) | — |
 | `agent.tools.webfetch.timeout` | Web fetch timeout (seconds) | `30` |
 | `agent.tools.web.max.redirects` | Max redirects to follow | `5` |
