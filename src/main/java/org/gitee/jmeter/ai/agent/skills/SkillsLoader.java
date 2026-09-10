@@ -12,6 +12,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 /**
  * Loader for agent skills.
@@ -203,9 +204,8 @@ public class SkillsLoader {
             return skills;
         }
 
-        try {
-            Files.list(workspaceSkillsDir)
-                    .filter(Files::isDirectory)
+        try (Stream<Path> dirs = Files.list(workspaceSkillsDir)) {
+            dirs.filter(Files::isDirectory)
                     .forEach(skillDir -> {
                         Path skillFile = skillDir.resolve("SKILL.md");
                         if (Files.exists(skillFile)) {
@@ -243,9 +243,8 @@ public class SkillsLoader {
     }
 
     private void loadBuiltinSkillsFromFilesystem(Path skillsDir, List<SkillInfo> skills) {
-        try {
-            Files.list(skillsDir)
-                    .filter(Files::isDirectory)
+        try (Stream<Path> dirs = Files.list(skillsDir)) {
+            dirs.filter(Files::isDirectory)
                     .forEach(skillDir -> {
                         Path skillFile = skillDir.resolve("SKILL.md");
                         if (Files.exists(skillFile)) {
