@@ -10,7 +10,7 @@ import org.gitee.jmeter.ai.agent.model.ProgressUpdate;
  *
  * <p>累积来源仅 {@code INTERMEDIATE_RESPONSE}（注入驱动续跑的中间回复）——
  * THINKING 事件受思考展示开关影响（{@code <think>} 包裹/剥离后形态不定），
- * 不作为累积来源（design D5）；{@code onStream} 无调用方（无流式 API）。
+ * 不作为累积来源；{@code onStream} 无调用方（无流式 API）。
  * 部分内容定位为「尽力而为」：无注入续跑的回合并无中间回复可累积，快照为空。
  *
  * <p>线程安全：回调从 agent-loop / 子代理池线程打点，取消/超时读取在

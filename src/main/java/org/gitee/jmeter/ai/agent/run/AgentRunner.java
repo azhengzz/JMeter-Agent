@@ -277,7 +277,7 @@ public class AgentRunner {
     }
 
     /**
-     * runAgentLoop 单次运行的共享可变状态（design D4）：while 体、两大分支方法与注入
+     * runAgentLoop 单次运行的共享可变状态：while 体、两大分支方法与注入
      * 检查点都读写这里的字段，替代原先散落在巨方法体内的局部变量。可变字段仅在 run
      * 执行线程上触碰（run 同步直调，无跨线程发布）。
      */
@@ -421,7 +421,7 @@ public class AgentRunner {
             log.warn("Max iterations reached: {}", state.maxIterations);
 
             // Injection drain 6: after max iterations (drain only, don't continue loop).
-            // 手写保留、不走 checkpoint(design D4):此处绕过 MAX_INJECTION_CYCLES 上限、
+            // 手写保留、不走 checkpoint:此处绕过 MAX_INJECTION_CYCLES 上限、
             // 直接 append、永不 continue——已用满 5 周期后打到 maxIterations 的场景仍须抽干。
             if (spec.getInjectionCallback() != null) {
                 List<String> remaining = spec.getInjectionCallback().apply(MAX_INJECTIONS_PER_TURN);
@@ -604,7 +604,7 @@ public class AgentRunner {
     }
 
     /**
-     * 注入检查点仪式（inj1–inj5 五处同构块的去重，design D4）：抽干注入队列并把结果并回
+     * 注入检查点仪式（inj1–inj5 五处同构块的去重）：抽干注入队列并把结果并回
      * {@code state}（injectionCycles/hadInjections），返回是否应继续下一迭代。
      *
      * <p>只收敛同构部分——各调用侧 continue 路径的 hook 差异（inj1/4/5 带

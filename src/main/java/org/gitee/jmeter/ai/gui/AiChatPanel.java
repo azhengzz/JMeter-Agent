@@ -635,8 +635,8 @@ public class AiChatPanel extends JPanel
 
     /**
      * 事件入口：通知线程不保证（ipc-worker / loop 线程 / EDT / 本地提交线程）。
-     * 通知时快照会话代数（/new 翻转后到达的旧会话事件整段丢弃）；EDT 上零跳直派
-     * （G1），否则 invokeLater。
+     * 通知时快照会话代数（/new 翻转后到达的旧会话事件整段丢弃）；EDT 上零跳直派，
+     * 否则 invokeLater。
      */
     @Override
     public void onTurnEvent(TurnEvent event) {
@@ -675,7 +675,7 @@ public class AiChatPanel extends JPanel
             case TURN_COMPLETED -> {
                 // 远程 /new 清屏（空闲路径）：不可见 IPC 命令回合无 STARTED（不在活回合
                 // 集合），但其 cmdNew 已把会话数据清空——面板转录须随之清空翻代数，
-                // 否则显示态与 session jsonl 永久分叉（spec R2「面板即将清理」前提对
+                // 否则显示态与 session jsonl 永久分叉（「面板即将清理」的前提对
                 // 远程重置同样成立）。本地 /new 不经此（handleNewCommand 先清屏再提交）。
                 if (!turn.origin().isLocalPanel() && "/new".equals(turn.echoText())) {
                     clearTranscriptForRemoteReset();
@@ -713,7 +713,8 @@ public class AiChatPanel extends JPanel
             case REJECTED_BUSY -> {
                 try {
                     messageProcessor.appendMessage(chatArea.getStyledDocument(),
-                            "Delegation rejected: a turn is already running; the caller was told to retry later.",
+                            "Session busy: a turn is already running and rejected this message"
+                                    + " (queue full or delegation); retry later.",
                             getThemeColor("Label.disabledForeground", Color.GRAY), false);
                 } catch (BadLocationException e) {
                     log.error("Error appending busy-reject notice", e);
@@ -1032,10 +1033,10 @@ public class AiChatPanel extends JPanel
     }
 
     /**
-     * 本地路径唯一提交点：把消息交给 AgentLoop，一切呈现复用回合事件流——You 行/
-     * loading/Stop 武装来自 TURN_STARTED（EDT 上零跳同步武装），busy 期命令走
-     * COMMAND_RESULT，进度/终态走 PROGRESS/TURN_COMPLETED。future 通道留给发起方
-     * （CLI/委派）消费，面板不持有。
+     * Sole local submit point: hands the message to AgentLoop; all rendering
+     * (You line, loading/Stop arming, progress, final state) is driven by the
+     * turn event stream. The future is left to the original caller (CLI or
+     * delegated turns); the panel does not hold it.
      */
     private void submitToLoop(String message) {
         log.info("Submitting user message: {}", message);
@@ -1067,7 +1068,7 @@ public class AiChatPanel extends JPanel
      * then dispatch {@code /new} through the normal submit path. The "You: /new"
      * echo and the receipt are event-rendered: busy 期 cmdNew 同步执行（忙期注入路由 →
      * COMMAND_RESULT），空闲期经完整回合（TURN_STARTED 武装 + 终态自复位——刻意的
-     * UX 差异③，见 design D3）。
+     * UX 差异③）。
      */
     private void handleNewCommand() {
         // /new 即重置：代数与活回合集合一并翻转（语义见 advanceRenderEpoch）。
@@ -1354,7 +1355,7 @@ public class AiChatPanel extends JPanel
      * 必已摘除」不变式：STOP 后立即输入走正常发送，而非被注入垂死回合遭静默作废。
      * 垂死回合的收尾等待（≤5s）在后台线程。取消后的复位无条件执行（不依赖
      * TURN_CANCELLED 事件）：回合已终、终态事件仍在 EDT 队列未出队的毫秒窗口内点击
-     * Stop 不死寂（design D3）。
+     * Stop 不死寂。
      */
     private void stopActiveTask() {
         if (agentLoop != null) {

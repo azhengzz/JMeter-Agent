@@ -70,14 +70,14 @@ public class AgentLoop {
     private final long subagentDrainTimeoutMs;
     // 会话 → 在跑回合注册表：turn 聚合后单表承载原 activeTurnTokens/
     // activeTurnHandles/abortFlags/completionLatches/activeTasks/drainTimedOut 六张
-    // map（design D1）。Turn 身份即令牌——子代理 spawn 时捕获 Turn 引用、公告前比对
+    // map。Turn 身份即令牌——子代理 spawn 时捕获 Turn 引用、公告前比对
     // 注册表当前值，回合已结束才迟迟返回的结果不喂给后继回合。条目生命周期
     // [startTurn 注册 → 回合任务体外层 finally 按值摘除]（契约见 Turn/TurnRegistry）；
     // 跨 {@code switchAiService} 的 loop 重建不迁移——句柄 id 进程级单调，陈旧 loop
     // 的迟到事件不可能撞上新回合 id。
     private final TurnRegistry activeTurnTokens = new TurnRegistry();
     // 本线程当前正在执行的回合（原 turnOwnedByThisThread + currentTurnSelf/TurnSelfRef
-    // + ownResetEpoch 三个 ThreadLocal 的聚合，design D3）：回合内命令（/new、关闭整合
+    // + ownResetEpoch 三个 ThreadLocal 的聚合）：回合内命令（/new、关闭整合
     // 清空）触发 signalCancel 时按<b>回合身份</b>豁免调用者自身——取消自身会在命令
     // 返回前杀死自己（用户看到 CancellationException 而非确认），但同会话的其他回合
     // （Stop→/new 序列里垂死回合在 /new 排队期间 re-publish 的旧会话孤儿）仍必须随

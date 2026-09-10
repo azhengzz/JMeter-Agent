@@ -17,7 +17,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * 一个回合（turn）的全部生命周期状态（design D1「Turn 聚合」）。
+ * 一个回合（turn）的全部生命周期状态。
  *
  * <p>收敛前同一回合的状态散落在按 sessionKey 索引的 6 张 map 里
  * （activeTasks/abortFlags/completionLatches/activeTurnTokens/drainTimedOut/
@@ -27,7 +27,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * 视图按 Turn 身份比较）。
  *
  * <p><b>保序武装（staggered arming）：</b>字段并非构造时一次武装——后写字段的写入
- * 时机与被收敛的旧 map put 一一对应，不得被单次构造+注册压扁（design Risks ①）：
+ * 时机与被收敛的旧 map put 一一对应，不得被单次构造+注册压扁：
  * 压扁会改变 [startTurn 起步 → future 武装] 窗口内 signalCancel 的行为路径与终态
  * 事件 Kind（如排队回合本应走「abortFlag 置位 + 任务头预检作废」，提前武装 future
  * 会让窗口内的取消改走 future.cancel + TURN_CANCELLED）。武装次序：
@@ -38,7 +38,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *       从此刻起可等收尾；</li>
  *   <li>{@link #armQueue()}（= 旧 {@code injectionManager.register} 创建队列并占
  *       路由槽）：队列即回合私有字段（容量取 {@code AiConfig.getInjectionQueueSize()}）；
- *       Phase 4 起路由槽 = 注册表条目 + {@code closed} 标志（design D2），队列武装
+ *       Phase 4 起路由槽 = 注册表条目 + {@code closed} 标志，队列武装
  *       前 offer/hasActiveRun 视为槽未上线（对应旧「槽 map 尚无 put」窗口）；</li>
  *   <li>{@link #armFuture}（= 旧 activeTasks.put，execute 之后）：signalCancel 据此
  *       future.cancel(true)。早于该时点的取消只能靠 abortFlag，且两个窗口语义不同
@@ -59,7 +59,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <p><b>可见性：</b>构造后写入的字段一律 volatile——写入线程（提交线程 / loop 线程）
  * 与读取线程（EDT、ipc-worker 等取消方）之间不总有 happens-before 边（executor 提交
  * 的 happens-before 只覆盖任务体内部的读写）。仅 loop 线程读写的字段（epoch/
- * drainTimedOut/ownResetEpoch）volatile 为防御性对齐 design（D1 风险表）。
+ * drainTimedOut/ownResetEpoch）volatile 为防御性加严。
  */
 public final class Turn {
 
@@ -83,7 +83,7 @@ public final class Turn {
     private volatile CompletableFuture<AgentResponse> future;
 
     /**
-     * 注入槽已摘除的显式表达（design D2「closed 双生命周期」）：条目本身活到 latch
+     * 注入槽已摘除的显式表达（closed 双生命周期）：条目本身活到 latch
      * 释放点（{@code TurnRegistry} 的真正 remove），注入路由的早期死亡——signalCancel
      * 摘槽（closeRouting）/ 回尾 cleanup（身份条件置位）——以本标志表达，
      * {@code offer}/{@code hasActiveRun} 据此派生「槽已摘」。置位一律经
@@ -108,7 +108,7 @@ public final class Turn {
      * 「本回合自身命令造成的翻转」——不重读会话当前代数，免被派发窗口内并发的
      * 外来重置（"+" 点击、关闭整合清空）污染。不可经 registry.find(sessionKey)
      * 定位：同 key 新回合可能已注册，find 会把代数写进错误回合、击穿重置代数栅栏
-     * （design D1 ThreadLocal 收敛约束）。初始 {@link #OWN_RESET_EPOCH_UNSET}。
+     * （ThreadLocal 收敛约束）。初始 {@link #OWN_RESET_EPOCH_UNSET}。
      */
     private volatile long ownResetEpoch = OWN_RESET_EPOCH_UNSET;
 
