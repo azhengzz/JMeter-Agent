@@ -824,7 +824,12 @@ public class AgentLoop {
         // 1. Set abort flag first (signals agent loop to stop) — 豁免调用者自身。
         //    future 未武装（排队窗口）或未完成 ⟺ 旧 abortFlags 表项存在
         //    （[注册 → whenComplete 摘除]），置位与返回值都以该窗口为准。
+        //    终态已发的收尾缝隙（emitTerminal → future.complete 之间的内层
+        //    finally，见 startTurn）不再置位：中止一个已完成回合是空动作，且
+        //    abortFlag 会经收尾的 republishLeftovers(cancelled=…) 把本应
+        //    re-publish 的注入残留误判作废。
         boolean abortVisible = turn != null
+                && !turn.handle().terminalEmitted()
                 && (turn.future() == null || !turn.future().isDone());
         if (abortVisible && turn != selfTurn) {
             turn.abortFlag().set(true);
@@ -839,9 +844,10 @@ public class AgentLoop {
         //    + 任务头取消预检作废；更早的 [register → armFuture]（如 TURN_STARTED 同步
         //    派发期间）future 未武装、预检不可见，任务取出后首次迭代查 abortFlag 中止
         //    （空内容 TURN_COMPLETED，见 Turn「保序武装」）。两种窗口均无需 interrupt。
-        //    回合任务体在跑期间 future 必未完成（complete 在内层
-        //    finally 之后），无需 isDone 复查；对已死/已复用线程的迟到中断由收尾置
-        //    null 挡住，复用线程上的残留中断位由 AgentRunner 入口清扫。
+        //    回合任务体在跑期间终态必未发、future 必未完成（complete 在内层
+        //    finally 之后），无需 isDone 复查；终态已发的收尾缝隙里 runnerThread
+        //    已被内层 finally 置 null，本步判空天然跳过（迟到中断防护即此机制）；
+        //    复用线程上的残留中断位由 AgentRunner 入口清扫。
         //    runnerThread 单次读入局部再判空解引用：判空与 interrupt 若各读一次
         //    volatile，收尾置 null 落在两读之间会 NPE 并吞掉第 3-5 步（对抗审查
         //    2026-09-02 确认的回归窗口；旧 AgentRunner.interrupt() 即局部快照写法）。
@@ -852,8 +858,12 @@ public class AgentLoop {
 
         // 3. Cancel the future — 豁免调用者自身。future 已武装且未完成 ⟺ 旧
         //    activeTasks 表项存在且可取消；条目不在此摘除，后续取消经 isDone 自然跳过。
+        //    终态已发的收尾缝隙不 cancel：cancel 会让任务体随后的 complete 对已取消
+        //    future 静默丢弃结果、IpcServer 超时分流误报 504「已取消」而回合实际
+        //    完整生效。
         boolean cancelled = false;
         if (turn != null && turn.future() != null && !turn.future().isDone()
+                && !turn.handle().terminalEmitted()
                 && turn != selfTurn) {
             cancelled = turn.future().cancel(true);
             log.info("Cancelled active task for session {}: {}", sessionKey, cancelled);

@@ -242,6 +242,59 @@ class AgentLoopAdversarialTest {
     }
 
     // ------------------------------------------------------------------
+    // 终态已发 → future 未落定的收尾缝隙：signalCancel 不得破坏已完成回合
+    // （2026-09-09 审计 P1 修复钉定：terminalEmitted 守卫）
+    // ------------------------------------------------------------------
+
+    /**
+     * 停车订阅者钉死 loop 线程于 [emitTerminal → future.complete] 缝隙内
+     * （TURN_COMPLETED 的同步派发点跑在 loop 线程）：终态已认领、future 未落定。
+     * 此刻的 signalCancel（IPC 超时路径的精确交错）不得置 abortFlag、不得 cancel
+     * future——否则完整生效的回合被报「已取消」（IpcServer 504 谎报）、注入残留
+     * 被 republishLeftovers 误作废。放行后 future 必须以真实结果完成。
+     */
+    @Test
+    void signalCancelDuringTerminalEmissionGap_doesNotCancelCompletedTurn() throws Exception {
+        ScriptedCall call1 = aiService.scriptGated(LLMResponse.text("R1"));
+        CompletableFuture<AgentResponse> f1 = loop.processMessage("M1", sessionKey);
+        await(call1.entered, "first LLM call started");
+
+        CountDownLatch terminalDispatched = new CountDownLatch(1);
+        CountDownLatch releaseSubscriber = new CountDownLatch(1);
+        loop.addTurnSubscriber(new TurnSubscriber() {
+            @Override public void onTurnEvent(TurnEvent event) {
+                if (event.kind() == TurnEvent.Kind.TURN_COMPLETED) {
+                    terminalDispatched.countDown();
+                    try {
+                        releaseSubscriber.await(10, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            }
+        });
+
+        complete(call1);  // 回合走终态：loop 线程进入 TURN_COMPLETED 同步派发点并停住
+        assertTrue(terminalDispatched.await(TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                "loop 线程必须钉死在终态派发点（缝隙内）");
+
+        // 缝隙内：终态已认领、future 未落定——超时取消不得破坏已完成回合
+        Turn turn = (Turn) loop.currentTurnToken(sessionKey).identity();
+        assertTrue(turn.handle().terminalEmitted(), "窗口前提：终态认领已发生");
+        assertFalse(f1.isDone(), "窗口前提：future 确未落定（钉在缝隙内）");
+
+        assertFalse(loop.signalCancel(sessionKey),
+                "终态已发的回合无可取消对象（abort 不可见、future 不可 cancel）");
+        assertFalse(f1.isCancelled(), "future 不得被 cancel（否则 CLI 收 504 谎报）");
+        assertFalse(turn.abortFlag().get(), "abortFlag 不得置位（否则注入残留被误作废）");
+
+        releaseSubscriber.countDown();  // 放行：收尾继续，future 以真实结果落定
+        assertEquals("R1", f1.get(TIMEOUT_SECONDS, TimeUnit.SECONDS).getContent(),
+                "放行后回合必须以完整结果完成，而非 CancellationException");
+        awaitUntil(() -> !loop.hasActiveRun(sessionKey), "settles");
+    }
+
+    // ------------------------------------------------------------------
     // 委派语义：健康 busy 拒绝 vs 垂死放行
     // ------------------------------------------------------------------
 
@@ -678,10 +731,14 @@ class AgentLoopAdversarialTest {
         probe.start();
         assertTrue(probeParked.await(5, TimeUnit.SECONDS), "probe 须先停稳");
 
-        // mock Turn：future 未武装（排队窗口语义）、runnerThread 首读见 probe 次读见 null
+        // mock Turn：future 未武装（排队窗口语义）、runnerThread 首读见 probe 次读见 null。
+        // handle() 桩真实句柄（terminalEmitted=false）：signalCancel 第 1/3 步的终态
+        // 守卫解引用它——mock 默认返回 null 会 NPE，且排队窗口语义本就终态未发
         Turn mockTurn = Mockito.mock(Turn.class);
         Mockito.when(mockTurn.abortFlag()).thenReturn(new AtomicBoolean());
         Mockito.when(mockTurn.future()).thenReturn(null);
+        Mockito.when(mockTurn.handle()).thenReturn(
+                new TurnHandle(sessionKey, TurnOrigin.LOCAL_PANEL, "echo", false));
         Mockito.when(mockTurn.runnerThread()).thenReturn(probe, (Thread) null);
         registry.register(sessionKey, mockTurn);
 
