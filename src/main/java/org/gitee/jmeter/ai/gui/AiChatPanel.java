@@ -701,7 +701,7 @@ public class AiChatPanel extends JPanel
                 appendCancelLine(event.cause(), turn.origin());
             }
             case INJECTED -> {
-                // 本地注入回显统一走事件（面板自渲染/嗅探已随 injectMessage 退役）；
+                // 本地注入回显统一走事件，不经面板自渲染/嗅探；
                 // IPC 前缀（[from cli] 等）天然区分来源
                 try {
                     messageProcessor.appendStyled(chatArea.getStyledDocument(),

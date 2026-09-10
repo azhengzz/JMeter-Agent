@@ -286,9 +286,8 @@ public class AgentLoop {
             TurnRegistry.OfferStatus offered = activeTurnTokens.offer(sessionKey, message, false);
             if (offered == TurnRegistry.OfferStatus.OFFERED) {
                 log.info("Message enqueued for mid-turn injection in session {}", sessionKey);
-                // 事件流（唯一通道）：注入 ack 无条件派发——本地注入回显不再由面板自
-                // 渲染（injectMessage 退役）；来源区分（injectorOrigin）供订阅端
-                // 显示域判定
+                // 事件流（唯一通道）：注入 ack 无条件派发——本地注入回显同样由事件
+                // 驱动、不经面板自渲染；来源区分（injectorOrigin）供订阅端显示域判定
                 dispatchTurnEvent(TurnEvent.injected(sessionKey, origin, message));
                 return CompletableFuture.completedFuture(
                     AgentResponse.success("Message injected into current conversation."));
@@ -721,7 +720,7 @@ public class AgentLoop {
     /**
      * Update last usage stats.
      */
-    public void setLastUsage(Map<String, Integer> usage) {
+    private void setLastUsage(Map<String, Integer> usage) {
         this.lastUsage = usage != null ? Map.copyOf(usage) : Map.of();
     }
 
@@ -921,17 +920,6 @@ public class AgentLoop {
         executorService.shutdown();
         sessionManager.shutdown();
         log.info("AgentLoop shutdown complete");
-    }
-
-    /**
-     * Inject a follow-up message into an active agent run.
-     * Called from the UI when user sends a message during agent processing.
-     *
-     * @return true if the message was queued successfully
-     */
-    public boolean injectMessage(String sessionKey, String message) {
-        return activeTurnTokens.offer(sessionKey, message, false)
-                == TurnRegistry.OfferStatus.OFFERED;
     }
 
     /**

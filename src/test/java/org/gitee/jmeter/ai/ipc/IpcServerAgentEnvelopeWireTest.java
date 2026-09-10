@@ -7,6 +7,7 @@ import org.gitee.jmeter.ai.agent.AgentLoopFactory;
 import org.gitee.jmeter.ai.agent.context.ContextBuilder;
 import org.gitee.jmeter.ai.agent.memory.MemoryConsolidator;
 import org.gitee.jmeter.ai.agent.memory.MemoryStore;
+import org.gitee.jmeter.ai.agent.model.AgentResponse;
 import org.gitee.jmeter.ai.agent.model.LLMResponse;
 import org.gitee.jmeter.ai.agent.presenter.TurnEvent;
 import org.gitee.jmeter.ai.agent.presenter.TurnOrigin;
@@ -253,8 +254,12 @@ class IpcServerAgentEnvelopeWireTest {
                 () -> postRaw("/agent", agentRequest("[delegated-from wire-test] tune the plan", true), 20_000));
         assertTrue(call1.entered.await(WAIT_SECONDS, TimeUnit.SECONDS),
                 "the delegated turn must be in flight");
-        // 忙期注入：直连 loop 注入队列（委派消息并发 POST 会被 Phase 2 硬拒绝，故不走 HTTP）
-        assertTrue(loop.injectMessage(session, "mid-turn follow-up"),
+        // 忙期注入：直连 loop 的生产注入入口（processMessage 忙期走 Phase 2 offer，
+        // 本地源拿注入 ack；委派消息并发 POST 会被硬拒绝，故不走 HTTP）
+        AgentResponse injAck = loop.processMessage("mid-turn follow-up", session)
+                .get(WAIT_SECONDS, TimeUnit.SECONDS);
+        assertTrue(injAck.isSuccess() && injAck.getContent() != null
+                        && injAck.getContent().startsWith("Message injected"),
                 "injection must queue on the in-flight turn");
         call1.release.countDown();
         // 确定性锚：注入检查点已发布中间回复 PARTIAL-1 并进入第二次 LLM 调用

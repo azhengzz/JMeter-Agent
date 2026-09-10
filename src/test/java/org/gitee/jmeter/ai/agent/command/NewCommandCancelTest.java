@@ -149,7 +149,7 @@ class NewCommandCancelTest {
             assertTrue(await(() -> loop.hasActiveRun("chat:main")),
                 "run should become active");
 
-            // Dispatch /new mid-run, exactly as the EDT does via injectMessage.
+            // Dispatch /new mid-run, exactly as the EDT does via processMessage.
             CompletableFuture<AgentResponse> newCmd =
                 loop.processMessage("/new", "chat:main");
             AgentResponse result = newCmd.get(20, TimeUnit.SECONDS);
