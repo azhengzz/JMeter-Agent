@@ -283,7 +283,8 @@ public class AgentLoop {
             }
 
             // Route to pending queue for mid-turn injection
-            if (activeTurnTokens.offer(sessionKey, message, false)) {
+            TurnRegistry.OfferStatus offered = activeTurnTokens.offer(sessionKey, message, false);
+            if (offered == TurnRegistry.OfferStatus.OFFERED) {
                 log.info("Message enqueued for mid-turn injection in session {}", sessionKey);
                 // 事件流（唯一通道）：注入 ack 无条件派发——本地注入回显不再由面板自
                 // 渲染（injectMessage 退役）；来源区分（injectorOrigin）供订阅端
@@ -292,6 +293,20 @@ public class AgentLoop {
                 return CompletableFuture.completedFuture(
                     AgentResponse.success("Message injected into current conversation."));
             }
+            if (offered == TurnRegistry.OfferStatus.FULL) {
+                // 队满：槽存活（健康回合仍在跑）——拒绝为 busy，绝不落穿 Phase 3 开
+                // 新回合：register 的 latest-wins put 会把仍在跑的健康回合整条替换出
+                // 注册表，其 abortFlag/runnerThread/future 三条取消通道全断（Stop 谎报、
+                // 超时取消误杀后继、旧会话响应复活进刚清空的 jsonl——2026-09-09 审计
+                // P0 修复）。与 delegated 分支同款 busy 语义（事件 + 错误回执），消息
+                // 由发起方稍后重试。
+                dispatchTurnEvent(TurnEvent.rejectedBusy(sessionKey));
+                return CompletableFuture.completedFuture(AgentResponse.error(
+                    "session busy: injection queue is full for session " + sessionKey
+                        + "; retry after the current turn drains the queue"));
+            }
+            // NO_SLOT：[hasActiveRun→offer] 窗口内槽被摘（垂死/交接）——落穿 Phase 3
+            // 开新回合是正确归宿
         }
 
         // Phase 3: Normal processing (via executor)
@@ -905,7 +920,8 @@ public class AgentLoop {
      * @return true if the message was queued successfully
      */
     public boolean injectMessage(String sessionKey, String message) {
-        return activeTurnTokens.offer(sessionKey, message, false);
+        return activeTurnTokens.offer(sessionKey, message, false)
+                == TurnRegistry.OfferStatus.OFFERED;
     }
 
     /**
@@ -930,8 +946,10 @@ public class AgentLoop {
             // re-publishLeftovers 清理队列残留时会先检查 InjectionItem.isAnnouncement()——
             // 公告直接丢弃（其结论仍可经 subagent_status 查询），只有用户消息才会被
             // re-publish 成一个新的用户回合。不区分的话，这条子代理结果公告会被误当
-            // 成用户输入伪造出本不存在的回合。
-            return activeTurnTokens.offer(sessionKey, message, true);
+            // 成用户输入伪造出本不存在的回合。队满与槽缺失同返 false（公告丢弃是
+            // 两种失败下都正确的归宿）。
+            return activeTurnTokens.offer(sessionKey, message, true)
+                    == TurnRegistry.OfferStatus.OFFERED;
         }
     }
 

@@ -389,7 +389,7 @@ class AiChatPanelIpcTurnPresenterTest {
         awaitEdtDrained();
 
         JTextPane chatArea = field(panel, "chatArea");
-        assertTrue(chatArea.getText().contains("Delegation rejected"),
+        assertTrue(chatArea.getText().contains("Session busy"),
                 "busy 快拒必须渲染系统提示行");
         assertTrue(chatArea.getText().contains("[Injected] You: [from cli] extra input"),
                 "注入消息必须以注入回显样式渲染（含来源前缀）");

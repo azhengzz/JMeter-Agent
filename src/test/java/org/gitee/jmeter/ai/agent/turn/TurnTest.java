@@ -34,14 +34,14 @@ class TurnTest {
         Turn t1 = newTurn("s");
         registry.register("s", t1);
         t1.armQueue();
-        assertTrue(registry.offer("s", "m1", false));
+        assertTrue(registry.offer("s", "m1", false) == TurnRegistry.OfferStatus.OFFERED);
 
         // 后继回合占槽（put 替换）：路由指向新队列，旧队列由旧回合句柄继续持有
         Turn t2 = newTurn("s");
         registry.register("s", t2);
         t2.armQueue();
         assertNotSame(t1.queue(), t2.queue());
-        assertTrue(registry.offer("s", "m2", false));
+        assertTrue(registry.offer("s", "m2", false) == TurnRegistry.OfferStatus.OFFERED);
 
         // 按句柄抽干：t1 的消息绝不会被 t2 的回合抽走
         assertEquals(List.of("m1"), texts(t1.drain(10)));
@@ -54,7 +54,7 @@ class TurnTest {
         Turn t1 = newTurn("s");
         registry.register("s", t1);
         t1.armQueue();
-        assertTrue(registry.offer("s", "m1", false));
+        assertTrue(registry.offer("s", "m1", false) == TurnRegistry.OfferStatus.OFFERED);
         Turn t2 = newTurn("s");
         registry.register("s", t2);
         t2.armQueue();
@@ -64,7 +64,7 @@ class TurnTest {
         assertEquals(List.of("m1"), texts(leftover1));
         assertTrue(registry.hasActiveRun("s"), "后继回合的路由槽必须存活");
 
-        assertTrue(registry.offer("s", "m2", false));
+        assertTrue(registry.offer("s", "m2", false) == TurnRegistry.OfferStatus.OFFERED);
         List<InjectionItem> leftover2 = registry.cleanup("s", t2);
         assertEquals(List.of("m2"), texts(leftover2));
         assertFalse(registry.hasActiveRun("s"), "最后一个回合收尾后槽应清空");
@@ -76,16 +76,38 @@ class TurnTest {
         Turn t = newTurn("s");
         registry.register("s", t);
         t.armQueue();
-        assertTrue(registry.offer("s", "m1", false));
+        assertTrue(registry.offer("s", "m1", false) == TurnRegistry.OfferStatus.OFFERED);
 
         registry.closeRouting("s", t);
         assertFalse(registry.hasActiveRun("s"), "取消即摘槽");
-        assertFalse(registry.offer("s", "m2", false), "槽已摘除，offer 必须失败（computeIfPresent 原子语义）");
+        assertEquals(TurnRegistry.OfferStatus.NO_SLOT, registry.offer("s", "m2", false),
+                "槽已摘除，offer 必须失败（computeIfPresent 原子语义）");
 
         // 死任务善后：句柄仍可抽干残留，且不误摘（槽已不在）
         List<InjectionItem> leftover = registry.cleanup("s", t);
         assertEquals(List.of("m1"), texts(leftover));
         assertFalse(registry.hasActiveRun("s"));
+    }
+
+    /**
+     * offer 三态（2026-09-09 审计 P0 修复的钉定）：槽存活但队列满必须返回 FULL 而
+     * 非 NO_SLOT——doProcessMessage 据此分流（FULL → busy 拒绝；NO_SLOT → 落穿开
+     * 新回合），两者混同曾让队满消息落穿 startTurn 把健康回合整条替换出注册表。
+     */
+    @Test
+    void offerQueueFull_returnsFull_notNoSlot() {
+        TurnRegistry registry = new TurnRegistry();
+        Turn t = newTurn("s");
+        registry.register("s", t);
+        t.armQueue();
+        int capacity = t.queue().size() + t.queue().remainingCapacity();
+        for (int i = 0; i < capacity; i++) {
+            assertEquals(TurnRegistry.OfferStatus.OFFERED, registry.offer("s", "m-" + i, false),
+                    "填满队列的第 " + i + " 条应入队成功");
+        }
+        assertEquals(TurnRegistry.OfferStatus.FULL, registry.offer("s", "overflow", false),
+                "队满必须返回 FULL（槽存活），不得混同 NO_SLOT");
+        assertTrue(registry.hasActiveRun("s"), "队满不等于槽摘除——路由仍存活");
     }
 
     /**
@@ -107,12 +129,13 @@ class TurnTest {
         // 陈旧快照摘槽：必须落空（槽是后继的），后继路由照常存活可注入
         registry.closeRouting("s", t1);
         assertTrue(registry.hasActiveRun("s"), "后继的路由不得被陈旧取消快照误摘");
-        assertTrue(registry.offer("s", "m-late", false), "后继必须仍可注入");
+        assertTrue(registry.offer("s", "m-late", false) == TurnRegistry.OfferStatus.OFFERED,
+                "后继必须仍可注入");
 
         // 本尊摘槽才生效
         registry.closeRouting("s", t2);
         assertFalse(registry.hasActiveRun("s"));
-        assertFalse(registry.offer("s", "m2", false));
+        assertEquals(TurnRegistry.OfferStatus.NO_SLOT, registry.offer("s", "m2", false));
 
         // null 快照（取消方未观察到回合）不置位任何条目
         Turn t3 = newTurn("s");
@@ -120,7 +143,7 @@ class TurnTest {
         t3.armQueue();
         registry.closeRouting("s", null);
         assertTrue(registry.hasActiveRun("s"), "null 快照不得置 closed");
-        assertTrue(registry.offer("s", "m3", false));
+        assertTrue(registry.offer("s", "m3", false) == TurnRegistry.OfferStatus.OFFERED);
     }
 
     /**
@@ -168,8 +191,8 @@ class TurnTest {
         Turn t = newTurn("s");
         registry.register("s", t);
         t.armQueue();
-        assertTrue(registry.offer("s", "user-msg", false));
-        assertTrue(registry.offer("s", "subagent-announce", true));
+        assertTrue(registry.offer("s", "user-msg", false) == TurnRegistry.OfferStatus.OFFERED);
+        assertTrue(registry.offer("s", "subagent-announce", true) == TurnRegistry.OfferStatus.OFFERED);
 
         List<InjectionItem> items = t.drain(10);
         assertEquals(2, items.size());

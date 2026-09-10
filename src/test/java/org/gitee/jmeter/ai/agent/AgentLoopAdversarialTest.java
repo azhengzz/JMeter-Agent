@@ -285,16 +285,18 @@ class AgentLoopAdversarialTest {
     }
 
     // ------------------------------------------------------------------
-    // 队列满穿透：put 替换槽发生在原回合存活时（per-turn 所有权的关键路径）
+    // 队列满拒绝：健康回合的槽位与可取消性不得被队满消息破坏
+    // （2026-09-09 审计 P0 修复：offer 队满曾落穿 Phase 3 起 startTurn，
+    //  latest-wins put 把仍在跑的健康回合整条替换出注册表——其取消三通道全断）
     // ------------------------------------------------------------------
 
     /**
-     * 队列容量 20：第 21 条消息 offer 失败穿透 Phase 3 起独立回合并 put 替换路由槽，
-     * 此时原回合仍存活且按句柄继续抽自己的队列——两回合互不干扰，20 条注入 15 条
-     * 被消化、5 条超限残留走 re-publish，全部消息有归宿。
+     * 队列容量 20：第 21 条消息 offer 见 FULL（槽存活）——必须 busy 拒绝（事件 +
+     * 错误回执），不得穿透 Phase 3 开新回合。原回合保持槽位与队列所有权：20 条注入
+     * 15 条被消化、5 条超限残留走 re-publish，全部消息有归宿。
      */
     @Test
-    void queueFull_21stMessage_fallsThroughToNewTurn_putReplaceSafe() throws Exception {
+    void queueFull_21stMessage_busyRejected_originalTurnKeepsSlot() throws Exception {
         subscribeOrphans(5);  // 20 - 15（5 周期 × 3 条）= 5 条超限残留
         ScriptedCall call1 = aiService.scriptGated(LLMResponse.withToolCalls(
                 List.of(new ToolCall("c1", "noop_tool", Map.of())), "step 1"));
@@ -308,10 +310,14 @@ class AgentLoopAdversarialTest {
                     "队列未满时第 " + i + " 条应注入成功");
         }
 
-        // 第 21 条：offer 失败（队满）→ 穿透 Phase 3 → 独立回合 future + put 替换槽
+        // 第 21 条：offer 见 FULL（槽存活、健康回合仍在跑）→ busy 拒绝，不得穿透成新回合
         CompletableFuture<AgentResponse> f21 = loop.processMessage("OVERFLOW-MSG", sessionKey);
-        assertFalse(f21.isDone(), "第 21 条应穿透成独立回合 future，而非立即 ack");
-        assertTrue(loop.hasActiveRun(sessionKey), "穿透回合占槽后路由仍应报 active");
+        assertTrue(f21.isDone(), "第 21 条应立即回执（busy 拒绝），不得穿透成独立回合 future");
+        AgentResponse r21 = f21.get(1, TimeUnit.SECONDS);
+        assertFalse(r21.isSuccess(), "队满拒绝应为错误回执");
+        assertTrue(r21.getErrorMessage() != null && r21.getErrorMessage().contains("queue is full"),
+                "拒绝信息应可读地说明队满：" + r21.getErrorMessage());
+        assertTrue(loop.hasActiveRun(sessionKey), "原回合的槽位不得被队满消息的任何路径替换");
 
         // T1 余下脚本：4 次工具调用（各触发一个注入周期）+ 最终回复
         for (int i = 2; i <= 5; i++) {
@@ -322,16 +328,41 @@ class AgentLoopAdversarialTest {
 
         complete(call1);
         assertEquals("T1-FINAL", f1.get(TIMEOUT_SECONDS, TimeUnit.SECONDS).getContent(),
-                "原回合按句柄抽自己的队列，不受穿透回合 put 替换槽影响");
+                "原回合保持槽位与队列所有权，照常消化注入并完成");
 
         assertTrue(orphans.latch.get().await(TIMEOUT_SECONDS, TimeUnit.SECONDS),
                 "5 条超限残留应各产生一个 REPUBLISH 源回合 STARTED 事件");
         assertEquals(5, orphans.started.size());
 
-        AgentResponse r21 = f21.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        assertTrue(r21.isSuccess(), "穿透的独立回合应正常完成（脚本耗尽 → DEFAULT-FINAL）");
-
         awaitUntil(() -> !loop.hasActiveRun(sessionKey), "all turns settle");
+    }
+
+    /**
+     * 队满拒绝后原回合仍可取消（注册表未被替换的直接后果验证）：第 21 条 busy 拒绝
+     * 后 Stop 必须命中原回合——旧缺陷下消息穿透 put 替换了原回合表项，Stop 只能取消
+     * 到新排队的回合，原回合从此不可停止地继续烧 token/改测试计划。
+     */
+    @Test
+    void queueFull_originalTurnRemainsCancellable() throws Exception {
+        ScriptedCall call1 = aiService.scriptGated(LLMResponse.text("R1"));
+        CompletableFuture<AgentResponse> f1 = loop.processMessage("M1", sessionKey);
+        await(call1.entered, "first LLM call started");
+
+        for (int i = 1; i <= 20; i++) {
+            AgentResponse ack = loop.processMessage("INJ-" + i, sessionKey)
+                    .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            assertTrue(ack.getContent().startsWith("Message injected"),
+                    "队列未满时第 " + i + " 条应注入成功");
+        }
+        AgentResponse r21 = loop.processMessage("OVERFLOW-MSG", sessionKey).get(1, TimeUnit.SECONDS);
+        assertFalse(r21.isSuccess(), "第 21 条应被 busy 拒绝（队满）");
+
+        // Stop 仍命中原回合：abort + future.cancel + 收尾抽干作废
+        assertTrue(loop.signalCancel(sessionKey), "队满后 Stop 必须能取消到原回合");
+        assertThrows(CancellationException.class, () -> f1.get(TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                "原回合的 future 必须被取消（注册表条目未被替换）");
+        complete(call1);
+        awaitUntil(() -> !loop.hasActiveRun(sessionKey), "cancelled turn settles");
     }
 
     // ------------------------------------------------------------------
@@ -480,7 +511,7 @@ class AgentLoopAdversarialTest {
 
             Thread offerer = new Thread(() -> {
                 for (int i = 0; i < 60; i++) {
-                    if (registry.offer(key, "m-" + i, false)) {
+                    if (registry.offer(key, "m-" + i, false) == TurnRegistry.OfferStatus.OFFERED) {
                         acked.add("m-" + i);
                     }
                     offeredCount.incrementAndGet();
@@ -539,7 +570,7 @@ class AgentLoopAdversarialTest {
 
             Thread offerer = new Thread(() -> {
                 for (int i = 0; i < 60; i++) {
-                    if (registry.offer(key, "m-" + i, false)) {
+                    if (registry.offer(key, "m-" + i, false) == TurnRegistry.OfferStatus.OFFERED) {
                         acked.add("m-" + i);
                     }
                     offeredCount.incrementAndGet();
