@@ -6,7 +6,7 @@
 
     <groupId>org.gitee</groupId>
     <artifactId>jmeter-agent</artifactId>
-    <version>0.3.2</version>
+    <version>0.3.3</version>
     <name>jmeter-agent</name>
     <description>Gitee Ai - JMeter Agent for performance engineers</description>
     <licenses>
