@@ -126,32 +126,58 @@ public class SessionManager {
      *
      * <p>文件写持 session 的 monitor（与 {@link Session} 各方法同一把锁）串行化：
      * 会话重置线程（EDT 清空落盘）与回合载体线程（追加落盘）并发写同一 jsonl 时，
-     * 两个 {@code TRUNCATE_EXISTING} 写句柄按各自偏移交错会写出撕裂内容。
+     * 两个写路径按各自偏移交错会写出撕裂内容。
+     *
+     * <p><b>原子写（对齐 {@code MemoryStore.writeLongTermMemory}）：</b>先写完整
+     * 临时文件再原子替换——写中途被杀（agent-loop 为 daemon 线程，JVM 退出不等
+     * 写完）或盘满中断都不留半截 jsonl，移动前的旧文件始终完整；撕裂 jsonl 曾被
+     * 加载侧整文件丢弃、再被 {@link #getOrCreate} 的空会话覆写不可逆销毁）。
      */
     public void saveSession(Session session) {
         Path sessionFile = getSessionFile(session.getKey());
         synchronized (session) {
-            try (BufferedWriter writer = Files.newBufferedWriter(sessionFile)) {
-                // Line 1: metadata
-                ObjectNode metadata = mapper.createObjectNode();
-                metadata.put("_type", "metadata");
-                metadata.put("key", session.getKey());
-                metadata.put("created_at", session.getCreatedAt().toString());
-                metadata.put("updated_at", session.getUpdatedAt().toString());
-                metadata.putObject("metadata");
-                metadata.put("last_consolidated", session.getLastConsolidatedIndex());
-                writer.write(mapper.writeValueAsString(metadata));
-                writer.newLine();
-
-                // Lines 2+: messages（getMessages 已是快照拷贝，迭代安全）
-                for (Message message : session.getMessages()) {
-                    ObjectNode msgNode = messageToJson(message);
-                    writer.write(mapper.writeValueAsString(msgNode));
+            Path tmp = null;
+            try {
+                tmp = Files.createTempFile(sessionStorage, "session-", ".tmp");
+                try (BufferedWriter writer = Files.newBufferedWriter(tmp)) {
+                    // Line 1: metadata
+                    ObjectNode metadata = mapper.createObjectNode();
+                    metadata.put("_type", "metadata");
+                    metadata.put("key", session.getKey());
+                    metadata.put("created_at", session.getCreatedAt().toString());
+                    metadata.put("updated_at", session.getUpdatedAt().toString());
+                    metadata.putObject("metadata");
+                    metadata.put("last_consolidated", session.getLastConsolidatedIndex());
+                    writer.write(mapper.writeValueAsString(metadata));
                     writer.newLine();
-                }
 
+                    // Lines 2+: messages（getMessages 已是快照拷贝，迭代安全）
+                    for (Message message : session.getMessages()) {
+                        ObjectNode msgNode = messageToJson(message);
+                        writer.write(mapper.writeValueAsString(msgNode));
+                        writer.newLine();
+                    }
+                }
+                try {
+                    Files.move(tmp, sessionFile,
+                            java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                            java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+                } catch (java.nio.file.AtomicMoveNotSupportedException e) {
+                    Files.move(tmp, sessionFile,
+                            java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                }
             } catch (IOException e) {
                 log.error("Failed to save session: {}", session.getKey(), e);
+            } finally {
+                if (tmp != null) {
+                    try {
+                        Files.deleteIfExists(tmp);
+                    } catch (IOException e) {
+                        // move 成功后 tmp 已不存在（清理无害）；move 失败时清掉半截
+                        // tmp 防堆积——旧 jsonl 完好，本轮回退到上次成功的落盘
+                        log.debug("Failed to delete temp session file {}", tmp, e);
+                    }
+                }
             }
         }
     }
@@ -192,7 +218,18 @@ public class SessionManager {
             while ((line = reader.readLine()) != null) {
                 if (line.trim().isEmpty()) continue;
 
-                JsonNode node = mapper.readTree(line);
+                JsonNode node;
+                try {
+                    node = mapper.readTree(line);
+                } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+                    // 逐行容忍（对齐下方 jsonToMessage 的既有语义）：半截/损坏行只丢弃
+                    // 本行、完好前缀照常加载——写中途被杀/盘满留下的撕裂行不再让整
+                    // 个会话文件失效、再被 getOrCreate 的空会话覆写不可逆销毁
+                    // （2026-09-09 审计 P1 修复）
+                    log.warn("Skipping corrupted session line in {}: {}",
+                            sessionFile.getFileName(), e.getMessage());
+                    continue;
+                }
 
                 if (node.has("_type") && "metadata".equals(node.get("_type").asText())) {
                     sessionKey = node.has("key") ? node.get("key").asText() : null;
