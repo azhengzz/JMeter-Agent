@@ -127,6 +127,7 @@ class AiChatPanelIpcTurnPresenterTest {
                 "来源消息（带前缀）必须以 You: 行渲染");
         assertTrue(stopButton.isVisible(), "回合运行中 Stop 按钮必须可见");
         assertNotNull(sendButton.getToolTipText(), "Send 必须切入注入模式");
+        assertEquals("Insert", sendButton.getText(), "Send 必须切入插入模式（文字）");
 
         panel.onTurnEvent(TurnEvent.progress(turn, ProgressUpdate.thinking("THINKING-TRACE")));
         panel.onTurnEvent(TurnEvent.completed(turn, AgentResponse.success("FINAL-ANSWER")));
@@ -147,6 +148,7 @@ class AiChatPanelIpcTurnPresenterTest {
         assertTrue(html.contains("FINAL-ANSWER"), "终结必须走 appendBotResponse 路径 " + diag);
         assertFalse(stopButton.isVisible(), "回合结束（无后续回合）Stop 按钮必须隐藏");
         assertNull(sendButton.getToolTipText(), "Send 必须退出注入模式");
+        assertEquals("Send", sendButton.getText(), "Send 必须退出插入模式（文字复位）");
     }
 
     @Test
@@ -348,6 +350,7 @@ class AiChatPanelIpcTurnPresenterTest {
                 "无条件清 loading——不依赖取消事件到达");
         assertFalse(stopButton.isVisible(), "无条件恢复发送模式");
         assertNull(sendButton.getToolTipText(), "Send 退出注入模式");
+        assertEquals("Send", sendButton.getText(), "Send 退出插入模式（文字复位）");
         assertTrue(chatTextOnEdt(chatArea).contains("Stopped"),
                 "本地取消由 Stopped. 行交代");
     }
@@ -863,6 +866,7 @@ class AiChatPanelIpcTurnPresenterTest {
                             + "hasActiveRun 把本回合未摘的槽计作在跑回合致误判滞留；"
                             + "窗口内槽未摘=" + slotStillRoutedInsideWindow + "）");
             assertNull(sendButton.getToolTipText(), "Send 必须退出注入模式（复位完成）");
+            assertEquals("Send", sendButton.getText(), "Send 必须退出插入模式（文字复位完成）");
         } finally {
             releaseLoop.countDown(); // 任意断言失败也放行，防 tearDown 的回合排空等待卡死
             loop.removeTurnSubscriber(teardownWindowGate); // 门控订阅者不外漏到同类其他用例

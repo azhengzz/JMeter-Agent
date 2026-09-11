@@ -164,6 +164,7 @@ class AiChatPanelNewConversationTest {
         // 在此显式复位，否则 Stop 按钮常驻、Send 停留在注入模式
         assertFalse(stopButton.isVisible(), "Stop 按钮必须隐藏复位");
         assertNull(sendButton.getToolTipText(), "Send 按钮必须退出注入模式复位");
+        assertEquals("Send", sendButton.getText(), "Send 按钮必须退出插入模式复位（文字）");
 
         // 收尾：放行垂死回合的 LLM 门并等其任务收尾（不落盘、不渲染）
         complete(call1);

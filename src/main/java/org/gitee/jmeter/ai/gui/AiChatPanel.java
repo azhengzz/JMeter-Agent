@@ -1379,9 +1379,9 @@ public class AiChatPanel extends JPanel
         // Show the separate stop button
         stopButton.setVisible(true);
 
-        // Send button keeps "Send" text; routing stays sendMessage() — busy 与否由
-        // loop 的槽路由仲裁（Phase 2 注入 / Phase 1-2 命令 / 竞态下独立回合）
-        sendButton.setToolTipText("Send a follow-up message while AI is processing");
+        // Send 按钮忙时改显 Insert——点击效果是把新消息插入当前运行回合；
+        sendButton.setText("Insert");
+        sendButton.setToolTipText("Insert the message into the running AI task");
     }
 
     private void setButtonToSendMode() {
