@@ -10,6 +10,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * Adapter to convert legacy ProgressCallback to AgentHook.
@@ -81,6 +82,12 @@ public class ProgressCallbackHookAdapter implements AgentHook {
         if (callback == null || content == null || content.isEmpty()) return;
         String display = this.showThinking ? content : TextUtils.stripThink(content);
         publish(ProgressUpdate.intermediateResponse(display));
+    }
+
+    @Override
+    public void onUsage(Map<String, Integer> usage, AgentHookContext context) {
+        if (callback == null) return;
+        publish(ProgressUpdate.usage(usage));
     }
 
     @Override

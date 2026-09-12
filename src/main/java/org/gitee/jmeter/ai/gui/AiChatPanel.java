@@ -74,6 +74,8 @@ public class AiChatPanel extends JPanel
     private JTextArea messageField;
     private JButton sendButton;
     private JComboBox<String> modelSelector;
+    // 上下文窗口用量环形指示器（模型选择器右侧；repaint-only 更新，EDT only）
+    private ContextUsageRing contextRing;
     // Agent components
     private AgentLoop agentLoop;
     private ClaudeService claudeService; // Keep for model loading
@@ -171,6 +173,10 @@ public class AiChatPanel extends JPanel
                 return super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
             }
         });
+
+        // Context window usage ring: lives right of the model selector, refreshed by
+        // USAGE progress updates after every LLM call (see handleProgressNow).
+        contextRing = new ContextUsageRing();
 
         // Load models in background
         loadModelsInBackground();
@@ -421,7 +427,7 @@ public class AiChatPanel extends JPanel
         JPanel controlsRow = new JPanel(new BorderLayout(8, 0));
         controlsRow.add(new JLabel("Model"), BorderLayout.WEST);
 
-        JPanel modelGroup = new JPanel(new BorderLayout(0, 0)) {
+        JPanel modelGroup = new JPanel(new BorderLayout(6, 0)) {
             @Override
             public void setBounds(int x, int y, int width, int height) {
                 Container parent = getParent();
@@ -433,6 +439,8 @@ public class AiChatPanel extends JPanel
         };
         modelGroup.setOpaque(false);
         modelGroup.add(modelSelector, BorderLayout.CENTER);
+        // 用量环占 EAST（hgap=6 与 combo 留间隔；BorderLayout 给固定 preferred 宽 18px）
+        modelGroup.add(contextRing, BorderLayout.EAST);
         controlsRow.add(modelGroup, BorderLayout.CENTER);
 
         JPanel buttonRow = new JPanel(new FlowLayout(FlowLayout.RIGHT, 5, 0));
@@ -995,6 +1003,9 @@ public class AiChatPanel extends JPanel
     private void advanceRenderEpoch() {
         conversationGeneration++;
         liveTurnIds.clear();
+        // 会话重置联动：指示器随转录清空一并归零（旧回合迟到的 USAGE 进度已在
+        // dispatch 层被代数过滤，复位后无渗入）
+        contextRing.reset();
     }
 
     /**
@@ -1193,7 +1204,27 @@ public class AiChatPanel extends JPanel
      * invokeLater 后入队）。事件流是唯一渲染权威（P2 4.1 已删旧 presenter 腿的
      * {@code handleProgress} 包装）。
      */
+    /**
+     * USAGE 载荷 → 环形指示器：分子 = 最近一次 LLM 调用输入 tokens（真实计费口径），
+     * 分母 = 上下文窗口配置（governor 预算与 /status 同口径，实时读取）。只在 EDT
+     * （{@code handleProgressNow} 由 dispatch 自投后调用）。
+     */
+    private void updateContextRing(Object payload) {
+        if (payload instanceof Map<?, ?> usage) {
+            Object prompt = usage.get("prompt_tokens");
+            if (prompt instanceof Number n) {
+                contextRing.update(n.longValue(), AiConfig.getContextWindowTokens());
+            }
+        }
+    }
+
     private void handleProgressNow(ProgressUpdate update, long turnId) {
+        // USAGE 载荷面向上下文用量指示器（非文本渲染域）：早退于 removeLoadingIndicator，
+        // 不清 loading、不渲染聊天行（loading 武装只由回合生命周期规则管理）。
+        if (update.getType() == ProgressUpdate.Type.USAGE) {
+            updateContextRing(update.getPayload());
+            return;
+        }
         try {
             removeLoadingIndicator();
 

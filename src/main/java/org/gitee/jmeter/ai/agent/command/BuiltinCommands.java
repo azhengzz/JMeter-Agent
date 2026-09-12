@@ -40,12 +40,15 @@ public class BuiltinCommands {
         int lastOut = lastUsage.getOrDefault("completion_tokens", 0);
 
         int ctxTotal = contextWindowTokens;
-        int ctxEst = 0;
-        try {
-            ctxEst = ctx.getLoop().getMemoryConsolidator().estimateSessionTokens(ctx.getSessionOrCreate());
-        } catch (Exception ignored) {}
+        // 口径对齐用量环：优先 API 实报 prompt_tokens（本地 tokenizer 估算系统性偏低
+        // ~5%）；无实报（冷会话）才回落 estimateSessionTokens
+        int ctxEst = lastIn;
         if (ctxEst <= 0) {
-            ctxEst = lastIn;
+            try {
+                ctxEst = ctx.getLoop().getMemoryConsolidator().estimateSessionTokens(ctx.getSessionOrCreate());
+            } catch (Exception ignored) {
+                // best-effort：估算不可用时按无数据继续
+            }
         }
         int ctxPct = ctxTotal > 0 ? (int) ((ctxEst / (double) ctxTotal) * 100) : 0;
         String ctxUsedStr = ctxEst >= 1000 ? (ctxEst / 1000) + "k" : String.valueOf(ctxEst);

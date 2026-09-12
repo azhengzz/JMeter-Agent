@@ -3,6 +3,7 @@ package org.gitee.jmeter.ai.agent.hooks;
 import org.gitee.jmeter.ai.agent.model.ToolCall;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * Hook interface for extending AgentRunner behavior.
@@ -121,6 +122,18 @@ public interface AgentHook {
      * @param context The hook context
      */
     default void onIntermediateResponse(String content, AgentHookContext context) {
+        // Default: do nothing
+    }
+
+    /**
+     * Called after each LLM call that returns a non-empty token usage.
+     * Fires per iteration (not only at turn end), so live consumers can track the
+     * context window usage as the turn grows.
+     *
+     * @param usage Token usage from the LLM response (prompt_tokens / completion_tokens)
+     * @param context The hook context
+     */
+    default void onUsage(Map<String, Integer> usage, AgentHookContext context) {
         // Default: do nothing
     }
 }

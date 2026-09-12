@@ -385,6 +385,11 @@ public class AgentRunner {
             Map<String, Integer> respUsage = response.getUsage();
             if (respUsage != null && !respUsage.isEmpty()) {
                 context.setUsage(respUsage);
+                // Per-iteration usage notification (context-usage indicator): fires
+                // immediately after each LLM call, not only at turn end.
+                if (state.hook != null) {
+                    state.hook.onUsage(respUsage, context);
+                }
             }
 
             if (response.isError()) {

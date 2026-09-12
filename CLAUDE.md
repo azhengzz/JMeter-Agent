@@ -116,6 +116,7 @@ mvn clean package -DskipTests
 - **TurnEvent** / **TurnHandle** / **TurnOrigin** / **CancelCause** / **TurnSubscriber** - 回合事件流 5 类型。`TurnEvent` 7 种 Kind（TURN_STARTED/PROGRESS/TURN_COMPLETED/TURN_CANCELLED/INJECTED/REJECTED_BUSY/COMMAND_RESULT）；`TurnOrigin` 分 LOCAL_PANEL/IPC_CLI/IPC_DELEGATED/REPUBLISH；`TurnHandle` 携进程唯一回合 id 与显示域元数据
 - **订阅挂接**：订阅关系挂 `AgentLoopFactory` 静态表（`addTurnSubscriber` 记全局表并挂存活单例；模型切换换血 loop 后由 `createAgentLoop` 全量重挂，订阅不丢）；`AgentLoop.activeTurn(sessionKey)` 供面板懒创建时领养在跑 IPC 回合
 - **线程契约**：回调线程不保证（EDT/ipc-worker/loop 线程/池化线程均可能）；订阅端（如 AiChatPanel）自投 EDT + 通知时代数快照，防 /new 后迟到事件渗入新会话
+- **USAGE 进度载荷**：PROGRESS 事件可携带 `ProgressUpdate.Type.USAGE`（`AgentRunner` 每次 LLM 调用返回且 usage 非空时经 `AgentHook.onUsage` → adapter 发射，载荷 = usage map），专供上下文用量指示器；面板 `handleProgressNow` 对其早退于 `removeLoadingIndicator`（不清 loading、不渲染聊天行）
 
 **4 处刻意 UX 差异（本地回合显示域，防未来「对齐旧行为」误修）**：① 竞态注入成回合时补画 You 行（旧版该消息从转录消失）；② busy 期本地命令补画 You 行（旧版只渲染结果行）；③ 空闲 `/new` 经完整回合短暂武装 loading+Stop 后自复位（旧版直接渲染不武装）；④ `/new` 回执渲染时机为事件驱动（busy 期 COMMAND_RESULT / 空闲期终态）。
 
@@ -262,6 +263,7 @@ mvn clean package -DskipTests
 - **AiChatPanel** - 主 Swing 面板，包含聊天界面、模型选择器和元素建议（支持 Shift+Enter 换行、拖拽调整区域高度）；实现 `TurnSubscriber`——本地/IPC/委派回合的呈现统一由 AgentLoop 回合事件流驱动（唯一显示通道），自投 EDT + 通知时代数快照
 - **AiMenuItem** - 切换聊天面板的菜单项和工具栏按钮
 - **AiMenuCreator** - 创建 AI 相关菜单
+- **ContextUsageRing** - 上下文窗口用量环形指示器（模型选择器右侧；分子 = 最近一次 LLM 调用 `prompt_tokens`，分母 = `jmeter.ai.context.window.tokens`；repaint-only 更新防 revalidate 传播，会话重置经 `advanceRenderEpoch` 一并归零）
 - **MessageProcessor** - 处理 markdown 渲染和消息显示（支持 reasoningContent 结构化思考内容展示）
 - **ComponentFinder** - 查找 JMeter 组件
 - **CloseConsolidationDialog** - 关闭期记忆整合交互对话框（EDT 模态：告知未整合消息数 N（仅 user/assistant 口径），选"是"先 `cancelActiveTask` 停掉在跑回合、再经 SwingWorker 后台深度提炼并回传进度，提供"Skip & Exit"逃生按钮；N=0/测试运行中/开关关闭时不弹）。被取消的整合回合经共享 abort flag 写盘前放弃落盘（不会覆盖提炼结果）

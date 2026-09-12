@@ -1,5 +1,7 @@
 package org.gitee.jmeter.ai.agent.model;
 
+import java.util.Map;
+
 /**
  * Progress update from Agent Loop execution.
  * Used to communicate typed progress from the agent loop to the UI.
@@ -50,7 +52,14 @@ public class ProgressUpdate {
         /** Error message */
         ERROR,
         /** Intermediate AI response before injection continues (content = response text) */
-        INTERMEDIATE_RESPONSE
+        INTERMEDIATE_RESPONSE,
+        /**
+         * Token usage from the latest LLM call (payload = Map&lt;String, Integer&gt; with
+         * prompt_tokens / completion_tokens). Faces the context-usage indicator, not the
+         * chat text rendering domain: message is always empty and consumers that render
+         * text or manage the loading indicator must skip this type.
+         */
+        USAGE
     }
 
     public static ProgressUpdate progress(String message) {
@@ -75,6 +84,10 @@ public class ProgressUpdate {
 
     public static ProgressUpdate intermediateResponse(String content) {
         return new ProgressUpdate(content, Type.INTERMEDIATE_RESPONSE);
+    }
+
+    public static ProgressUpdate usage(Map<String, Integer> usage) {
+        return new ProgressUpdate("", Type.USAGE, usage);
     }
 
     private static String formatToolEvent(ToolEvent event) {
