@@ -318,23 +318,27 @@ public class AiChatPanel extends JPanel
         // their position untouched until they return to the bottom.
         messageProcessor.setAutoScroll(this::isChatAtBottom, this::scrollToBottom);
 
-        // Create the bottom panel with model selector and input controls
-        JPanel bottomPanel = new JPanel(new BorderLayout(5, 5));
+        // Create the bottom panel: context bar row (NORTH) + full-width input
+        // box (CENTER) + controls row (SOUTH: model selector left, buttons right).
+        // Minimum height tracks the preferred stack on every query (rather than
+        // being captured once here) so font zoom / LAF changes, which resize the
+        // input box, keep the divider from squeezing it below three rows.
+        JPanel bottomPanel = new JPanel(new BorderLayout(5, 5)) {
+            @Override
+            public Dimension getMinimumSize() {
+                return new Dimension(0, getPreferredSize().height);
+            }
+        };
         bottomPanel.setBorder(BorderFactory.createEmptyBorder(10, 0, 0, 0));
 
-        // Add model selector to the bottom panel
-        // modelPanel uses BorderLayout: WEST holds "Model: " + selector,
-        // CENTER holds the selection context bar so it stretches to the right.
-        JPanel modelPanel = new JPanel(new BorderLayout(8, 0));
-        JPanel modelLeft = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
-        JLabel modelLabel = new JLabel("Model: ");
-        modelLeft.add(modelLabel);
-        modelLeft.add(modelSelector);
-        modelPanel.add(modelLeft, BorderLayout.WEST);
+        // Context row: contextRow uses BorderLayout: CENTER holds the selection
+        // context bar so it stretches to (nearly) full row width, EAST holds the
+        // inject-context checkbox at the right edge.
+        JPanel contextRow = new JPanel(new BorderLayout(8, 0));
 
         // Selection context bar: shows current JMeter element + focused control
         selectionContextBar = new SelectionContextBar();
-        modelPanel.add(selectionContextBar, BorderLayout.CENTER);
+        contextRow.add(selectionContextBar, BorderLayout.CENTER);
 
         // Toggle: whether to inject current selection into UserMessage sent to LLM
         injectContextCheckBox = new JCheckBox("ToAI", SelectionTracker.isInjectToContextEnabled());
@@ -342,12 +346,9 @@ public class AiChatPanel extends JPanel
         injectContextCheckBox.setMargin(new Insets(0, 4, 0, 0));
         injectContextCheckBox.addItemListener(e ->
                 SelectionTracker.setInjectToContextEnabled(e.getStateChange() == ItemEvent.SELECTED));
-        modelPanel.add(injectContextCheckBox, BorderLayout.EAST);
+        contextRow.add(injectContextCheckBox, BorderLayout.EAST);
 
-        bottomPanel.add(modelPanel, BorderLayout.NORTH);
-
-        // Create the input panel with message field and send button
-        JPanel inputPanel = new JPanel(new BorderLayout(5, 0));
+        bottomPanel.add(contextRow, BorderLayout.NORTH);
 
         // Initialize message field
         messageField = new JTextArea(3, 20);
@@ -380,9 +381,10 @@ public class AiChatPanel extends JPanel
             }
         });
 
+        // Input box spans the full width of the bottom panel
         JScrollPane messageScrollPane = new JScrollPane(messageField);
         messageScrollPane.setBorder(BorderFactory.createEmptyBorder());
-        inputPanel.add(messageScrollPane, BorderLayout.CENTER);
+        bottomPanel.add(messageScrollPane, BorderLayout.CENTER);
 
         // Initialize send button
         sendButton = new JButton("Send");
@@ -405,25 +407,43 @@ public class AiChatPanel extends JPanel
         stopButton.setVisible(false);
         stopButton.addActionListener(e -> stopActiveTask());
 
-        // Button panel: Send (top) + Stop (bottom) vertical layout
-        // Buttons expand to fill full height and stretch with split pane drag
-        JPanel buttonPanel = new JPanel();
-        buttonPanel.setLayout(new BoxLayout(buttonPanel, BoxLayout.Y_AXIS));
-        Dimension maxButton = new Dimension(Integer.MAX_VALUE, Integer.MAX_VALUE);
-        sendButton.setMaximumSize(maxButton);
-        stopButton.setMaximumSize(maxButton);
-        sendButton.setAlignmentX(Component.CENTER_ALIGNMENT);
-        stopButton.setAlignmentX(Component.CENTER_ALIGNMENT);
-        buttonPanel.add(sendButton);
-        buttonPanel.add(Box.createVerticalStrut(4));
-        buttonPanel.add(stopButton);
-        inputPanel.add(buttonPanel, BorderLayout.EAST);
+        // Controls row below the input box: "Model" label on the left, Stop +
+        // Send right-aligned, model selector as the flexible middle. BorderLayout
+        // hands WEST/EAST their preferred sizes and all remaining width to CENTER,
+        // so when the panel narrows the combo shrinks (text clips, arrow stays
+        // clickable) instead of painting over the buttons. BorderLayout ignores
+        // preferred/maximum sizes on CENTER, so the wrapper caps the combo at
+        // half the row width by clipping its own setBounds — the cap only ever
+        // shrinks, so the shrink-when-narrow behavior above is unaffected.
+        // FlowLayout.RIGHT pins the buttons' right edge, so toggling Stop's
+        // visibility (or Send's Send/Insert relabel) only grows the row leftward
+        // — Send's position stays stable.
+        JPanel controlsRow = new JPanel(new BorderLayout(8, 0));
+        controlsRow.add(new JLabel("Model"), BorderLayout.WEST);
 
-        bottomPanel.add(inputPanel, BorderLayout.CENTER);
+        JPanel modelGroup = new JPanel(new BorderLayout(0, 0)) {
+            @Override
+            public void setBounds(int x, int y, int width, int height) {
+                Container parent = getParent();
+                if (parent != null) {
+                    width = Math.min(width, parent.getWidth() / 2);
+                }
+                super.setBounds(x, y, width, height);
+            }
+        };
+        modelGroup.setOpaque(false);
+        modelGroup.add(modelSelector, BorderLayout.CENTER);
+        controlsRow.add(modelGroup, BorderLayout.CENTER);
+
+        JPanel buttonRow = new JPanel(new FlowLayout(FlowLayout.RIGHT, 5, 0));
+        buttonRow.add(stopButton);
+        buttonRow.add(sendButton);
+        controlsRow.add(buttonRow, BorderLayout.EAST);
+
+        bottomPanel.add(controlsRow, BorderLayout.SOUTH);
 
         // Create vertical split pane to allow resizing between chat area and input area
         chatPanel.setMinimumSize(new Dimension(0, 100));
-        bottomPanel.setMinimumSize(new Dimension(0, 80));
 
         verticalSplitPane = new JSplitPane(JSplitPane.VERTICAL_SPLIT, chatPanel, bottomPanel);
         verticalSplitPane.setResizeWeight(0.9);

@@ -9,7 +9,6 @@ import java.awt.Graphics;
 import javax.swing.BorderFactory;
 import javax.swing.JPanel;
 import javax.swing.UIManager;
-import javax.swing.border.MatteBorder;
 
 import org.apache.jmeter.testelement.TestElement;
 import org.gitee.jmeter.ai.selection.SelectionSnapshot;
@@ -46,11 +45,7 @@ public class SelectionContextBar extends JPanel {
 
     public SelectionContextBar() {
         setOpaque(false);
-        Color borderColor = getThemeColor("Component.borderColor",
-                UIManager.getColor("Separator.foreground"));
-        setBorder(BorderFactory.createCompoundBorder(
-                new MatteBorder(0, 1, 0, 0, borderColor),
-                BorderFactory.createEmptyBorder(0, PADDING_X, 0, 0)));
+        setBorder(BorderFactory.createEmptyBorder(0, PADDING_X, 0, 0));
 
         Font baseFont = UIManager.getFont("Label.font");
         plainFont = baseFont != null ? baseFont.deriveFont(11f) : new Font(Font.SANS_SERIF, Font.PLAIN, 11);
